@@ -113,6 +113,53 @@ Observed over five cycles during development: the evaluated universe grew
 49 → 59 → 60 while each individual scan still returned ~45. Run it for an hour
 and it has seen far more than any one scan can.
 
+### The on-chain launch feed
+
+Watch mode also subscribes to pool creations directly on chain, so a token can
+enter the universe the moment its pool exists rather than when DexScreener gets
+around to listing it. Disable with `--no-launch-feed`.
+
+Four approaches were measured against mainnet before settling on a WebSocket
+subscription:
+
+| Approach | Result |
+| --- | --- |
+| `getProgramAccounts` over PumpSwap | 495,442 pools, 135MB, 32s per call — correct, nowhere near pollable |
+| Helius parsed-transaction `type=CREATE_POOL` | Returns nothing; the type taxonomy does not cover it |
+| A low-traffic sentinel account | None exists — every account common to five sampled creations is touched by every swap too |
+| `logsSubscribe` filtering for the creation instruction | Works |
+
+A graduating pump.fun token emits, in one transaction:
+
+```
+Program log: Instruction: MigrateV2      <- pump.fun hands over
+Program log: Instruction: CreatePool     <- the AMM pool appears
+Program log: Instruction: InitializeMint2
+```
+
+Measured over 180 seconds of live stream: 74,155 log notifications, of which 5
+were pool creations. The pool is then identified by **what it is** — owned by a
+known AMM program, exactly that program's pool-struct size — rather than by its
+position in the transaction, so a layout change yields nothing instead of a
+wrong address. The launched token is whichever of the pool's two mints is not
+SOL, USDC or USDT.
+
+One race is worth knowing about, because getting it wrong fails silently: the
+log notification fires the instant a block is confirmed, which is **earlier than
+the transaction becomes fetchable**. A single fetch attempt loses most launches.
+Resolution retries for about seven seconds, and the two failure modes are kept
+apart — `missed` means a transaction never became readable (a real gap),
+`skipped` means the pool was created on an AMM this tool cannot decode (routine,
+since a transaction mentioning one AMM can create a pool on another).
+
+Honest measurement of what this buys you: over one 180-second window the feed
+resolved 2 launches, skipped 4 on undecodable AMMs, missed 0 — and 1 of the 2
+was not yet listed on DexScreener. The edge is real but modest, on the order of
+a minute or two, and most fresh pools fail the market gates immediately anyway
+because they have no liquidity or trade history yet.
+
+### Watch state
+
 State lives in `out/watch-state.json` and survives restarts. Three behaviours
 make it usable rather than noisy:
 
@@ -399,8 +446,11 @@ Be clear-eyed about what this cannot see:
   service address will not be recognised as one, and a genuinely busy deployer
   wallet will be written off as a service.
 - **Social signal is ignored entirely.** No Twitter, no Telegram, no narrative.
-- **Discovery is shallow.** It reads DexScreener's profile and boost feeds, which
-  are partly pay-to-appear. A boosted token is an advertised token.
+- **Discovery leans on DexScreener.** Its profile and boost feeds are partly
+  pay-to-appear, and a boosted token is an advertised token. The on-chain launch
+  feed widens this but does not replace it.
+- **The launch feed only covers four AMMs.** Pools created on venues whose
+  layout is not decoded here are counted as skipped and never enter the universe.
 - **Nothing here is forward-looking.** Every metric describes the past.
 
 ## Layout
@@ -416,6 +466,7 @@ src/funding.ts      funder tracing and common-source grouping
 src/presence.ts     profile, socials, boosts and DexScreener paid orders
 src/phase.ts        drawdown-from-peak reconstruction
 src/watch.ts        watch-mode state, de-duplication and alert log
+src/launchfeed.ts   on-chain pool-creation stream over WebSocket
 src/base58.ts       pubkey encoding for raw account data
 src/checks.ts       pure decision logic — gates and scoring
 src/render.ts       terminal output

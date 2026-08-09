@@ -22,15 +22,42 @@ import { readPubkey } from './base58.ts';
 import { ratio, resolveHoldings, type RawAccount, type RpcLike } from './solana.ts';
 import type { LpStatus } from './types.ts';
 
-type LpLayout = { name: string; size: number; lpMintOffset: number };
+type LpLayout = {
+  name: string;
+  size: number;
+  lpMintOffset: number;
+  /**
+   * Offsets of the pool's two token mints, in layout order.
+   *
+   * These are *not* derivable from lpMintOffset: PumpSwap and Raydium v4 both
+   * put the pair 64 bytes before the LP mint, but CPMM puts it after and
+   * Meteora DAMM v1 puts the LP mint first. Each was read off a live pool.
+   *
+   * Which of the two is the traded token is decided by elimination — whichever
+   * is not SOL, USDC or USDT — because AMMs that sort their mints do not
+   * guarantee a fixed base/quote position.
+   */
+  mintOffsets: [number, number];
+};
 
 /** Pool programs that mint a fungible LP token, keyed by the pool account's owner. */
 export const LP_LAYOUTS: Record<string, LpLayout> = {
-  pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA: { name: 'PumpSwap', size: 301, lpMintOffset: 107 },
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': { name: 'Raydium AMM v4', size: 752, lpMintOffset: 464 },
-  CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C: { name: 'Raydium CPMM', size: 637, lpMintOffset: 136 },
-  Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB: { name: 'Meteora DAMM v1', size: 944, lpMintOffset: 8 },
+  pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA:
+    { name: 'PumpSwap', size: 301, lpMintOffset: 107, mintOffsets: [43, 75] },
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8':
+    { name: 'Raydium AMM v4', size: 752, lpMintOffset: 464, mintOffsets: [400, 432] },
+  CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C:
+    { name: 'Raydium CPMM', size: 637, lpMintOffset: 136, mintOffsets: [168, 200] },
+  Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB:
+    { name: 'Meteora DAMM v1', size: 944, lpMintOffset: 8, mintOffsets: [40, 72] },
 };
+
+/** Mints that are the quote side of a pair, never the token being launched. */
+export const QUOTE_MINTS = new Set([
+  'So11111111111111111111111111111111111111112',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+]);
 
 /**
  * Pool programs with no fungible LP token. Concentrated-liquidity venues track

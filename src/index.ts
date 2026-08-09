@@ -19,6 +19,7 @@ import { applyOrders, fetchOrders } from './presence.ts';
 import { derivePriceContext } from './phase.ts';
 import { renderDetail, renderRejected, renderTable } from './render.ts';
 import { isBlocked, loadState, logAlert, pruneState, recordVerdict, saveState } from './watch.ts';
+import { LaunchFeed, toWebSocketUrl } from './launchfeed.ts';
 import { execFileSync } from 'node:child_process';
 import type { Candidate, Enriched, LpStatus, MintSafety, Verdict } from './types.ts';
 
@@ -29,6 +30,7 @@ type Options = {
   limit: number;
   watchSeconds: number | null;
   notify: boolean;
+  launchFeed: boolean;
   statePath: string;
   alertLog: string;
   alertCooldownMs: number;
@@ -45,6 +47,7 @@ function parseArgs(argv: string[]): Options {
     limit: 15,
     watchSeconds: null,
     notify: false,
+    launchFeed: true,
     statePath: 'out/watch-state.json',
     alertLog: 'out/alerts.jsonl',
     // Long enough that a token hovering on a threshold cannot spam the loop.
@@ -65,6 +68,7 @@ function parseArgs(argv: string[]): Options {
         break;
       }
       case '--notify': opts.notify = true; break;
+      case '--no-launch-feed': opts.launchFeed = false; break;
       case '--state': opts.statePath = next(); break;
       case '--alert-log': opts.alertLog = next(); break;
       case '--cooldown': opts.alertCooldownMs = Number(next()) * 60_000; break;
@@ -132,6 +136,7 @@ Flags
 Watch mode — poll continuously, alert only on tokens that newly clear
   --watch [seconds]     Run on a loop (default 90s between cycles)
   --notify              macOS desktop notification per alert
+  --no-launch-feed      Disable the on-chain pool-creation stream
   --state <path>        State file (default out/watch-state.json)
   --alert-log <path>    JSONL alert log (default out/alerts.jsonl)
   --cooldown <minutes>  Do not re-alert the same token within this (default 360)
@@ -280,18 +285,28 @@ type ScanResult = {
 async function scanOnce(
   rpc: SolanaRpc,
   thresholds: Thresholds,
-  options: { skip?: (mint: string) => boolean; quiet?: boolean } = {},
+  options: { skip?: (mint: string) => boolean; extraMints?: string[]; quiet?: boolean } = {},
 ): Promise<ScanResult> {
   const say = (message: string) => {
     if (!options.quiet) process.stderr.write(message);
   };
 
   say('Discovering Solana tokens...\n');
-  const discovered = await discoverMints();
+  const feedMints = await discoverMints().catch(() => [] as string[]);
+  const extra = options.extraMints ?? [];
+  // Chain-sourced launches are additive: DexScreener rate-limiting no longer
+  // blanks a cycle when the launch feed has something.
+  const discovered = [...new Set([...extra, ...feedMints])];
   if (discovered.length === 0) throw new Error('discovery returned nothing — DexScreener may be rate-limiting');
 
   const mints = options.skip ? discovered.filter((m) => !options.skip!(m)) : discovered;
-  say(`Found ${discovered.length} tokens${mints.length !== discovered.length ? ` (${discovered.length - mints.length} already ruled out)` : ''}. Fetching market data...\n`);
+  const ruledOut = discovered.length - mints.length;
+  say(
+    `Found ${discovered.length} tokens` +
+      (extra.length > 0 ? ` (${extra.length} from the chain feed)` : '') +
+      (ruledOut > 0 ? ` (${ruledOut} already ruled out)` : '') +
+      '. Fetching market data...\n',
+  );
   if (mints.length === 0) return { scanned: 0, shortlisted: 0, verdicts: [], marketRejected: [] };
 
   const candidates = await fetchPairs(mints);
@@ -355,14 +370,29 @@ function notify(verdict: Verdict): void {
   }
 }
 
-async function runWatch(opts: Options, rpc: SolanaRpc) {
+async function runWatch(opts: Options, rpc: SolanaRpc, rpcUrl: string) {
   const state = loadState(opts.statePath);
   let running = true;
   let cycle = 0;
 
+  // Pools created since the last cycle, straight off the chain. Drained each
+  // cycle and merged into whatever DexScreener discovery returns.
+  const fromChain = new Map<string, { amm: string; migrated: boolean }>();
+  let feed: LaunchFeed | null = null;
+  if (opts.launchFeed) {
+    feed = new LaunchFeed({
+      wsUrl: toWebSocketUrl(rpcUrl),
+      rpc,
+      onLaunch: ({ mint, amm, migrated }) => fromChain.set(mint, { amm, migrated }),
+      onError: (message) => process.stderr.write(`  launch feed: ${message}\n`),
+    });
+    feed.start();
+  }
+
   const stop = () => {
     if (!running) return;
     running = false;
+    feed?.stop();
     saveState(opts.statePath, state);
     console.log(`\nStopped. State saved to ${opts.statePath}.`);
     process.exit(0);
@@ -380,8 +410,13 @@ async function runWatch(opts: Options, rpc: SolanaRpc) {
     cycle++;
     const startedAt = Date.now();
     try {
+      // Drain before scanning so a launch landing mid-cycle is not lost.
+      const launched = [...fromChain.keys()];
+      fromChain.clear();
+
       const result = await scanOnce(rpc, opts.thresholds, {
         skip: (mint) => isBlocked(state, mint),
+        extraMints: launched,
         quiet: true,
       });
 
@@ -394,9 +429,14 @@ async function runWatch(opts: Options, rpc: SolanaRpc) {
 
       const stamp = new Date().toISOString().slice(11, 19);
       const universe = Object.keys(state.seen).length;
+      const feedNote = feed
+        ? ` · chain feed ${feed.connected ? `${feed.count} launches` : 'reconnecting'}`
+        : '';
       process.stderr.write(
-        `[${stamp}] cycle ${cycle}: ${result.scanned} scanned, ${result.shortlisted} shortlisted, ` +
-          `${alerts.length} new · universe ${universe} · ruled out ${Object.keys(state.blocked).length}\n`,
+        `[${stamp}] cycle ${cycle}: ${result.scanned} scanned` +
+          (launched.length > 0 ? ` (+${launched.length} fresh)` : '') +
+          `, ${result.shortlisted} shortlisted, ${alerts.length} new · universe ${universe} · ` +
+          `ruled out ${Object.keys(state.blocked).length}${feedNote}\n`,
       );
 
       if (alerts.length > 0) {
@@ -449,7 +489,7 @@ async function main() {
 
   const rpc = new SolanaRpc(rpcUrl, throttleMs);
   if (opts.token) await runToken(opts.token, opts, rpc);
-  else if (opts.watchSeconds !== null) await runWatch(opts, rpc);
+  else if (opts.watchSeconds !== null) await runWatch(opts, rpc, rpcUrl);
   else await runScan(opts, rpc);
 }
 
