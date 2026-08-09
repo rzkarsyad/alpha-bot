@@ -1,0 +1,293 @@
+# degen-screener
+
+A Solana memecoin screener that runs on-chain safety gates first and ranks
+momentum second. Zero dependencies, no build step, no API key required to start.
+
+**What this does:** filters out tokens with known rug mechanics, so you spend
+attention only on the ones that are not obviously engineered to take your money.
+
+**What this does not do:** predict price. Nothing here says a token will go up.
+A passing token is one where the deployer has given up the easy exploits — it can
+still go to zero, and most memecoins do.
+
+## Setup
+
+Needs Node 22.18+ (it runs TypeScript directly; no install, no build).
+
+```bash
+cp .env.example .env
+```
+
+The screener works out of the box on the public RPC, but **the public RPC blocks
+`getTokenLargestAccounts`**, which disables the holder-concentration gate — the
+single most useful filter here. Verified at time of writing:
+
+| Endpoint | Authority checks | LP burned (supply=0) | Holders, bundles, funding, LP breakdown |
+| --- | --- | --- | --- |
+| `api.mainnet-beta.solana.com` | works | works | blocked (429) |
+| `solana-rpc.publicnode.com` | works | works | blocked (`Request blocked`) |
+| Helius / QuickNode / Alchemy free tier | works | works | works |
+
+The fully-burned LP case needs only the mint account, so it is verifiable
+anywhere — which covers most pump.fun graduates. Everything that starts from
+`getTokenLargestAccounts` — concentration, bundle detection, funder tracing, and
+the LP holder breakdown — needs a real RPC. When a check cannot run it says so
+in the output; it is never silently treated as a pass.
+
+Grab a free key from [helius.dev](https://helius.dev) and set it in `.env`:
+
+```
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+```
+
+## Usage
+
+Scan the discovery feeds:
+
+```bash
+node src/index.ts
+```
+
+See what was rejected and why — this is the part worth reading, because it
+teaches you what the failure modes actually look like:
+
+```bash
+node src/index.ts --show-rejected 20
+```
+
+Full due-diligence report on one token before you buy:
+
+```bash
+node src/index.ts --token <mint-address>
+```
+
+Loosen the gates (understand what you are giving up first):
+
+```bash
+node src/index.ts --min-liq 10000 --max-fdv 20000000 --min-age 15
+```
+
+Run `node src/index.ts --help` for every flag. Tests: `npm test`.
+
+## How it decides
+
+Two stages, in this order and never the other way around. No amount of chart
+action buys a token past a live mint authority.
+
+### Stage 1 — kill switches
+
+Fail any one of these and the token is excluded outright, regardless of score.
+
+| Gate | Why it matters |
+| --- | --- |
+| Mint authority revoked | Otherwise the deployer can print unlimited supply into your bid |
+| Freeze authority revoked | Otherwise your wallet can be frozen and you can never sell |
+| No permanent delegate | Token-2022 lets a delegate move tokens **out of your wallet** without approval |
+| No transfer hook | Arbitrary code runs on every transfer — the modern honeypot |
+| No transfer tax | Any skim on a memecoin is a red flag |
+| Accounts not frozen by default | Otherwise buyers are frozen the moment they buy |
+| Top-10 wallets < 25% of float | Above this, a handful of wallets can end the chart in one block |
+| No single wallet > 5% of float | A de facto rug switch |
+| Same-slot wallet clusters < 20% of float | A bundled launch: one entity behind many wallets |
+| Commonly-funded wallets < 20% of float | The same swarm, seeded from one address |
+| No single wallet > 10% of LP | That wallet can withdraw that share of the pool at will |
+| Liquidity ≥ $25k | Below this you cannot exit without catastrophic slippage |
+| FDV ≤ $5M | Above this the early thesis is already priced in |
+| 1h volume ≥ $20k and ≥ 100 trades | Below this you are the only exit liquidity |
+| 24h volume < 40× liquidity | Higher is the signature of wash trading, not demand |
+| Age 30min – 72h | Younger has no signal; older is not an early play |
+
+The concentration gate is the one that needs explaining. An AMM vault and a
+rug-pulling whale both look like an enormous holder. The difference is that a
+vault is program-derived, so its owner account is owned by a program rather than
+the System Program. Pools, escrows and burn addresses are excluded; what remains
+is supply that can actually be dumped on you. That classification is unit-tested
+in `test/holders.test.ts`.
+
+### Bundled launches
+
+The concentration gate above is exactly what a bundled launch is built to pass.
+The deployer buys through dozens of wallets in one atomic transaction bundle, so
+every individual wallet looks modest while one entity still controls the float.
+
+What the split cannot hide is timing. A Jito bundle lands atomically inside a
+single slot, so the wallets in it share an identical creation slot — down to the
+block. Organic buyers arrive spread across slots and minutes. Each top holder's
+token account is dated from the oldest entry in its signature history, then
+grouped by exact slot.
+
+Two figures come out of this, and they are deliberately kept apart:
+
+| Figure | Meaning | Effect |
+| --- | --- | --- |
+| `clusteredShare` | Float in wallets sharing an identical creation slot (groups of 3+) | **Rejects** above 20% |
+| `launchWindowShare` | Float bought within 30s of the first dated holder | Warns above 35% |
+
+The second only warns because a hot launch genuinely is busy — one live token
+sampled during development had 76 transactions in its genesis slot alone, mostly
+independent snipers racing. Slot *density* is not evidence of bundling. What is
+evidence is a group of **current top holders** sharing one block, which
+independent racers rarely manage.
+
+Stated plainly: same-slot is evidence of coordination, not proof of common
+ownership. Two unrelated snipers can land in one block, which is why clusters
+start at three wallets rather than two.
+
+Accounts whose signature history fills the lookback page cannot be dated —
+older entries exist that were never seen, and a wrong date would poison every
+cluster it joined. Those are counted as undated and disclosed rather than
+guessed at. The launch window is anchored on the earliest dated holder rather
+than the pair's creation time, so a migrated token is measured against its own
+genesis instead of its pool's.
+
+### Common funding
+
+Slot clustering catches wallets that *acted* together. It misses a deployer
+patient enough to spread the buys across separate blocks. Funding catches those:
+the wallets still had to get their SOL from somewhere, and a throwaway swarm is
+almost always seeded from one address.
+
+Each top holder's wallet is traced to the oldest transaction in its history —
+the point it first appeared on chain — and the System Program transfer that paid
+for it names the funder. Wallets are then grouped by funder.
+
+The failure mode this has to survive is exchanges. A Binance or Coinbase
+withdrawal wallet funds thousands of unrelated people, and naive grouping would
+flag every organic token that way. Rather than hardcode a list of exchange
+addresses that would rot, this uses activity: **an address with a saturated
+signature history is a service, not a deployer's burner.** Groups behind such a
+funder are dropped and the count is reported, so the exclusion is visible rather
+than silent.
+
+That heuristic was checked against live data. Sampling holders of an established
+token returned wallets that all saturated — traders, market makers, MEV bots —
+while fresh wallets on a new token resolved cleanly to distinct funders via
+`system:transfer`.
+
+Two details that are easy to get wrong:
+
+- **Commitment has to match.** Listing signatures at `confirmed` and then
+  fetching the transaction at the default `finalized` returns `null` for
+  anything not yet finalised — which is exactly the recent activity that matters
+  on a young token. Both calls use `confirmed`.
+- **A self-paid transaction reveals nothing.** If the wallet itself is the fee
+  payer, its SOL came from somewhere not in that transaction, so the fee-payer
+  fallback is refused rather than reporting the wallet as its own funder.
+
+This is the slowest check in the tool — two RPC calls per wallet, plus one per
+candidate funder group. `--skip-funders` turns it off.
+
+### LP burn / lock
+
+Every other gate asks whether the deployer can wreck the *token*. This one asks
+the separate question of whether anyone can withdraw the *liquidity* — the mint
+can be spotless and the pool still gets drained in one transaction.
+
+No per-protocol lock registry is involved. LP tokens are the claim on a pool's
+reserves, so the question reduces to who holds them:
+
+| Holder | Meaning |
+| --- | --- |
+| Burn address, or LP supply is zero | Claim destroyed — reserves can never be withdrawn |
+| Program/PDA | A locker or vault; withdrawable on its terms, not never |
+| Ordinary wallet | Someone can pull that share of the pool right now |
+
+The LP mint is read straight out of the pool account. Offsets were verified
+against live pools — each decodes to a genuine mint whose neighbouring fields
+match the pair's known base and quote mints:
+
+| AMM | Pool program | Size | LP mint offset |
+| --- | --- | --- | --- |
+| PumpSwap | `pAMMBay6…FMfXEA` | 301 | 107 |
+| Raydium AMM v4 | `675kPX9M…SUt1Mp8` | 752 | 464 |
+| Raydium CPMM | `CPMMoo8L…B5qKP1C` | 637 | 136 |
+| Meteora DAMM v1 | `Eo7WjKq6…Vn5UaB` | 944 | 8 |
+
+Concentrated-liquidity venues (Raydium CLMM, Meteora DLMM, Orca Whirlpool,
+Meteora DAMM v2) track positions as NFTs, and bonding curves hold reserves in a
+program vault, so there is no fungible LP token to burn. Those are reported as
+**not verifiable** — never as safe. Turn them into hard rejections with
+`--require-lp`.
+
+Two guards keep a stale offset from producing a confident wrong answer: the pool
+account size must match the layout, and the decoded address must actually parse
+as a mint. Fail either and the pool degrades to "not verifiable".
+
+A note on the difference the table makes explicit: **locked is not burned**. A
+timelock expires, and the tool cannot read unlock dates across every locker
+program, so majority-locked LP earns a warning rather than a clean pass.
+
+### Stage 2 — momentum score (0–100)
+
+Applied only to survivors, and only to rank them against each other. It is not a
+probability of anything.
+
+| Component | Max | Rewards |
+| --- | --- | --- |
+| Liquidity depth | 15 | Log-scaled — $200k is not 10× better than $20k in practice |
+| Turnover | 20 | Volume/liquidity near 8×; penalised when too dead or too washed |
+| Buy pressure | 20 | 1h and 6h blended, so one green candle cannot carry it |
+| Participation | 15 | Trade count as a proxy for distinct participants |
+| Distribution | 15 | Flatter top-10 scores higher |
+| Trend quality | 15 | Rising 6h base; **halved** when 1h is already +300% |
+
+That last penalty is deliberate. A vertical hourly candle is the part of the move
+that happened without you.
+
+## Tuning
+
+Every threshold lives in `src/config.ts` with a comment explaining what it
+protects against. Loosening them raises your hit rate and raises your rug rate.
+That trade is yours to make — make it deliberately, not because a scan came back
+empty. An empty scan is the normal result.
+
+## Known limits
+
+Be clear-eyed about what this cannot see:
+
+- **LP unlock dates are not read.** Locked LP is flagged as locked, but the tool
+  cannot tell you whether it unlocks tomorrow or in two years.
+- **LP holders come from a top-20 lookup.** When that does not cover the whole LP
+  supply the shortfall is reported as `accounted for`, and the pullable figure is
+  a lower bound rather than a total.
+- **Concentrated-liquidity pools cannot be checked this way.** CLMM/DLMM/Whirlpool
+  liquidity can still be withdrawn; there is simply no LP token to measure.
+- **Bundle and funding detection only see the current top holders.** Wallets that
+  already sold are invisible, and so is anything outside the top-20 lookup.
+- **Funding is traced one hop.** A deployer who fans SOL out through a layer of
+  intermediate wallets breaks the link; only the immediate funder is read.
+- **Very active wallets cannot be traced or dated at all.** Their history
+  saturates the lookback, so they are excluded and disclosed rather than guessed
+  at — a deployer who reuses busy wallets is invisible to both checks.
+- **The exchange exclusion is a heuristic, not a registry.** A quiet enough
+  service address will not be recognised as one, and a genuinely busy deployer
+  wallet will be written off as a service.
+- **Social signal is ignored entirely.** No Twitter, no Telegram, no narrative.
+- **Discovery is shallow.** It reads DexScreener's profile and boost feeds, which
+  are partly pay-to-appear. A boosted token is an advertised token.
+- **Nothing here is forward-looking.** Every metric describes the past.
+
+## Layout
+
+```
+src/config.ts       thresholds and constants — start here when tuning
+src/types.ts        shared shapes
+src/dexscreener.ts  discovery and market data (keyless)
+src/solana.ts       RPC, mint decoding, holder classification
+src/lp.ts           AMM pool layouts, LP burn/lock classification
+src/bundle.ts       account dating and same-slot cluster detection
+src/funding.ts      funder tracing and common-source grouping
+src/base58.ts       pubkey encoding for raw account data
+src/checks.ts       pure decision logic — gates and scoring
+src/render.ts       terminal output
+src/index.ts        CLI
+test/               unit tests for the decision logic
+```
+
+`src/checks.ts` and the analysis half of `src/solana.ts` are pure functions of
+their arguments, which is why the rules can be tested without a network.
+
+---
+
+This is a filtering tool, not financial advice. Assume any position can go to
+zero, and size accordingly.

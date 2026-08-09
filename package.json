@@ -1,0 +1,15 @@
+{
+  "name": "degen-screener",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Solana memecoin screener — on-chain safety gates first, momentum ranking second.",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "scan": "node src/index.ts",
+    "check": "node src/index.ts --token",
+    "test": "node --test 'test/**/*.test.ts'"
+  }
+}
