@@ -47,6 +47,22 @@ export type PriceContext = {
   phase: 'building' | 'running' | 'parabolic' | 'faded';
 };
 
+/**
+ * Rate-of-change signals that can fire before a price move rather than after
+ * one. Null means the five-minute window was too thin to read, which is a
+ * different claim from "not accelerating".
+ */
+export type Accumulation = {
+  /** Five-minute volume against the hourly average pace. 2.0 = twice the pace. */
+  volumeAcceleration: number | null;
+  /** Same for trade count — harder to fake than volume. */
+  tradeAcceleration: number | null;
+  /** Buy share over 5m minus buy share over 1h. Positive means buyers taking over. */
+  buyPressureShift: number | null;
+  /** Activity picking up while the price has not responded yet. */
+  coiled: boolean;
+};
+
 /** A Solana pair as returned by DexScreener, normalised to what we actually use. */
 export type Candidate = {
   mint: string;
@@ -168,6 +184,7 @@ export type Enriched = {
   bundle: BundleAnalysis | null;
   funding: FundingAnalysis | null;
   price: PriceContext;
+  accumulation: Accumulation;
   /** Populated when an on-chain lookup failed; the token is reported, not silently dropped. */
   onchainError: string | null;
 };
@@ -180,7 +197,8 @@ export type FailCode =
   | 'lp-unverifiable' | 'lp-pullable'
   | 'age-young' | 'age-old' | 'liquidity-unknown' | 'liquidity-thin'
   | 'fdv' | 'market-cap-low' | 'market-cap-high' | 'volume' | 'txns' | 'wash-trading'
-  | 'presence-bare' | 'no-socials' | 'not-paid' | 'drawdown' | 'meta';
+  | 'presence-bare' | 'no-socials' | 'not-paid' | 'drawdown' | 'meta'
+  | 'already-moved' | 'no-acceleration';
 
 /**
  * Gates a token can never grow out of, because they describe history rather

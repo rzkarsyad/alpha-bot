@@ -22,6 +22,18 @@ export type Thresholds = {
   minSocials: number;
   /** Reject once the price has fallen this far from its recent peak. */
   maxDrawdownFromPeak: number;
+  /**
+   * Pre-pump mode. Inverts the timing question: instead of requiring evidence
+   * that a move is underway, it requires the move to *not* have happened and
+   * looks for activity picking up beneath a flat price.
+   */
+  earlyMode: boolean;
+  /** In early mode, reject anything already up more than this over an hour. */
+  maxPriceChangeH1: number;
+  /** And over six hours — a slow grind counts as the move having happened too. */
+  maxPriceChangeH6: number;
+  /** Minimum five-minute volume pace against the hourly average. */
+  minVolumeAcceleration: number;
   /** Case-insensitive terms matched against name, symbol and DEX. Empty = no filter. */
   metaTerms: string[];
   /** Reject anything that does not match a meta term, rather than just ranking it lower. */
@@ -73,6 +85,10 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   requireDexPaid: false,
   minSocials: 1,
   maxDrawdownFromPeak: 0.5,
+  earlyMode: false,
+  maxPriceChangeH1: 60,
+  maxPriceChangeH6: 150,
+  minVolumeAcceleration: 1.3,
   metaTerms: [],
   metaOnly: false,
   minVolumeH1Usd: 20_000,

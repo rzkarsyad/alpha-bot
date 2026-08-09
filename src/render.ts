@@ -228,6 +228,21 @@ export function renderDetail(v: Verdict): string {
   }
 
   lines.push('');
+  lines.push(bold('Pre-pump signals'));
+  const acc = v.enriched.accumulation;
+  const rate = (value: number | null) => (value === null ? dim('too thin to read') : `${value.toFixed(1)}x hourly pace`);
+  lines.push(`  volume rate    ${rate(acc.volumeAcceleration)}`);
+  lines.push(`  trade rate     ${rate(acc.tradeAcceleration)}`);
+  lines.push(
+    `  buying shift   ${
+      acc.buyPressureShift === null
+        ? dim('n/a')
+        : `${acc.buyPressureShift >= 0 ? '+' : ''}${(acc.buyPressureShift * 100).toFixed(0)}pts over 5m`
+    }`,
+  );
+  lines.push(acc.coiled ? green('  coiled — activity picking up while price is flat') : dim('  not coiled'));
+
+  lines.push('');
   lines.push(bold('Market'));
   lines.push(`  age            ${c.ageMinutes === null ? '?' : formatAge(c.ageMinutes)}`);
   lines.push(`  liquidity      ${c.liquidityUsd === null ? 'n/a (bonding curve)' : usd(c.liquidityUsd)}`);

@@ -318,6 +318,62 @@ everything else. Matching is anchored at word starts, because plain substring
 matching is unusable here — the term `ai` hits "pl**ai**n", "ch**ai**n" and
 "s**ai**d", which would pass almost everything.
 
+### Pre-pump mode (`--early`)
+
+The default gates are structurally late, and it is worth being explicit about
+why rather than treating it as a tuning problem. Every floor —
+`minVolumeH1Usd: 20000`, `minTxnsH1: 100`, `minMarketCapUsd: 50000` — is
+evidence that a move **already started**. The momentum score then rewards
+turnover, buy pressure and trend, which are the same thing again. Run the
+default mode and it reliably returns tokens marked `parabolic`, because that is
+precisely what those numbers select for.
+
+`--early` asks the other question: is activity picking up *before* the price has
+responded? That shows up as a rate, not a level.
+
+```
+acceleration = 5-minute volume ÷ (hourly volume ÷ 12)
+```
+
+A token doing $600 in five minutes against $2,400 for the hour is running 3× its
+hourly pace. If the price has not moved, someone is accumulating into a flat
+chart. A token is **coiled** when three things hold at once: volume accelerating,
+trade count accelerating, and the price still flat. All three matter —
+acceleration on its own is equally consistent with being dumped into.
+
+What changes, and what does not:
+
+| | Default | `--early` |
+| --- | --- | --- |
+| Every safety gate | identical | **identical** |
+| Price already up | allowed | **rejected** (`--max-move`, default 60% / 1h) |
+| Min 1h volume | $20,000 | $3,000 |
+| Min market cap | $50,000 | $15,000 |
+| Min trades / 1h | 100 | 25 |
+| Min age | 30 min | 10 min |
+| Scored on | turnover, trend, buy pressure | acceleration, buy shift, **flatness** |
+
+Trade count is weighted alongside volume deliberately: a wash trader can move
+size in a single transaction but cannot cheaply manufacture many distinct
+trades.
+
+Two limits that cannot be tuned away:
+
+- **A five-minute window is noisy.** On an illiquid token three trades can double
+  the ratio, so acceleration is reported as `null` below a minimum absolute
+  activity floor — unreadable, not "a small number".
+- **Earlier means wrong more often.** Most accumulation is not a pump; it is a
+  bot cycling or a dev shuffling wallets. This finds candidates sooner and has a
+  far higher false-positive rate. That is the trade, and it is the whole point.
+
+A measured run showed what this exposes. In one scan the default mode passed two
+tokens, both already up 450–519% in an hour. `--early` passed none, and the
+rejection reasons named the cause directly: *already +1122% in 1h — the move
+started without you*, *already +393% in 1h*, *volume running 0.6x its hourly
+pace*. The DexScreener discovery feeds are themselves full of tokens that have
+already run. **That is why `--early` needs watch mode**, where the on-chain
+launch feed supplies pools the moment they exist rather than once they trend.
+
 ### Common funding
 
 Slot clustering catches wallets that *acted* together. It misses a deployer
@@ -465,6 +521,7 @@ src/bundle.ts       account dating and same-slot cluster detection
 src/funding.ts      funder tracing and common-source grouping
 src/presence.ts     profile, socials, boosts and DexScreener paid orders
 src/phase.ts        drawdown-from-peak reconstruction
+src/accumulation.ts pre-pump acceleration signals and early-mode scoring
 src/watch.ts        watch-mode state, de-duplication and alert log
 src/launchfeed.ts   on-chain pool-creation stream over WebSocket
 src/base58.ts       pubkey encoding for raw account data

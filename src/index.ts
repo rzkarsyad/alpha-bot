@@ -17,6 +17,7 @@ import { analyzeBundle } from './bundle.ts';
 import { analyzeFunders } from './funding.ts';
 import { applyOrders, fetchOrders } from './presence.ts';
 import { derivePriceContext } from './phase.ts';
+import { deriveAccumulation } from './accumulation.ts';
 import { renderDetail, renderRejected, renderTable } from './render.ts';
 import { isBlocked, loadState, logAlert, pruneState, recordVerdict, saveState } from './watch.ts';
 import { LaunchFeed, toWebSocketUrl } from './launchfeed.ts';
@@ -99,6 +100,21 @@ function parseArgs(argv: string[]): Options {
       case '--max-drawdown': t.maxDrawdownFromPeak = Number(next()) / 100; break;
       case '--meta': t.metaTerms = (next() ?? '').split(',').map((s) => s.trim()).filter(Boolean); break;
       case '--meta-only': t.metaOnly = true; break;
+      case '--early':
+        // Pre-pump hunt. Every floor drops, because the evidence the default
+        // gates demand is exactly the evidence that the move already started.
+        t.earlyMode = true;
+        t.minAgeMinutes = 10;
+        t.maxAgeHours = 6;
+        t.minLiquidityUsd = 8_000;
+        t.minMarketCapUsd = 15_000;
+        t.maxMarketCapUsd = 300_000;
+        t.maxFdvUsd = 300_000;
+        t.minVolumeH1Usd = 3_000;
+        t.minTxnsH1 = 25;
+        break;
+      case '--max-move': t.maxPriceChangeH1 = Number(next()); break;
+      case '--min-accel': t.minVolumeAcceleration = Number(next()); break;
       case '--fresh':
         // Preset for catching launches early: younger, smaller, and stricter
         // about the move not having happened yet.
@@ -172,6 +188,12 @@ Meta
 Presets
   --fresh               Newly-launched hunt: max 12h old, sub-$1M cap,
                         max 30% off its high
+  --early               Pre-pump hunt: catch accumulation BEFORE the move.
+                        Rejects anything already up, drops every floor, and
+                        scores on rate-of-change instead of momentum.
+                        Earlier than --fresh, and wrong far more often.
+  --max-move <pct>      Early mode: max 1h gain allowed (default ${DEFAULT_THRESHOLDS.maxPriceChangeH1})
+  --min-accel <x>       Early mode: min volume pace vs hourly (default ${DEFAULT_THRESHOLDS.minVolumeAcceleration})
 
 This tool filters out known rug mechanics. It does not predict price.
 `);
@@ -223,6 +245,7 @@ async function enrich(
         bundle: null,
         funding: null,
         price: derivePriceContext(candidate.priceChange),
+        accumulation: deriveAccumulation(candidate.volume, candidate.txns, candidate.priceChange),
         onchainError: batchError ?? 'mint account not found',
       });
       continue;
@@ -260,6 +283,7 @@ async function enrich(
     out.push({
       candidate, safety, holders, lp, bundle, funding,
       price: derivePriceContext(candidate.priceChange),
+      accumulation: deriveAccumulation(candidate.volume, candidate.txns, candidate.priceChange),
       onchainError: holders ? null : onchainError,
     });
   }
@@ -318,7 +342,9 @@ async function scanOnce(
       (candidate) =>
         ({
           candidate, safety: null, holders: null, lp: null, bundle: null, funding: null,
-          price: derivePriceContext(candidate.priceChange), onchainError: null,
+          price: derivePriceContext(candidate.priceChange),
+          accumulation: deriveAccumulation(candidate.volume, candidate.txns, candidate.priceChange),
+          onchainError: null,
         }) satisfies Enriched,
     )
     .map((enriched) => evaluate(enriched, thresholds));

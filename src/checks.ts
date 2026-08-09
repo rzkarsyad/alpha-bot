@@ -10,6 +10,7 @@
 
 import type { Thresholds } from './config.ts';
 import { isBare } from './presence.ts';
+import { scoreEarly } from './accumulation.ts';
 import type { Enriched, FailCode, Verdict } from './types.ts';
 
 export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
@@ -229,13 +230,45 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   }
 
   const price = enriched.price;
-  if (price.drawdownFromPeak > t.maxDrawdownFromPeak) {
-    fail('drawdown', 
-      `already ${pct(price.drawdownFromPeak)} below its recent high — the move played out without you`,
-    );
-  }
-  if (price.phase === 'parabolic') {
-    warnings.push('price is vertical right now — buying here is buying someone else\'s exit');
+  const accumulation = enriched.accumulation;
+
+  if (t.earlyMode) {
+    // The inversion. Default mode rejects a token whose move already ended;
+    // this rejects one whose move already *started*, because by then the
+    // question has been answered and the entry has been taken.
+    if (c.priceChange.h1 > t.maxPriceChangeH1) {
+      fail('already-moved', `already +${c.priceChange.h1.toFixed(0)}% in 1h — the move started without you`);
+    }
+    if (c.priceChange.h6 > t.maxPriceChangeH6) {
+      fail('already-moved', `already +${c.priceChange.h6.toFixed(0)}% over 6h — not pre-pump any more`);
+    }
+    if (accumulation.volumeAcceleration === null) {
+      fail('no-acceleration', 'five-minute window too thin to tell whether anything is picking up');
+    } else if (accumulation.volumeAcceleration < t.minVolumeAcceleration) {
+      fail(
+        'no-acceleration',
+        `volume running ${accumulation.volumeAcceleration.toFixed(1)}x its hourly pace ` +
+          `(want ${t.minVolumeAcceleration}x) — nothing is picking up`,
+      );
+    }
+    if (!accumulation.coiled) {
+      warnings.push('accelerating but not coiled — buying is not clearly taking over');
+    }
+    if (accumulation.buyPressureShift !== null && accumulation.buyPressureShift < -0.1) {
+      warnings.push(
+        `selling is taking over (${(accumulation.buyPressureShift * 100).toFixed(0)}pts in 5m) — ` +
+          'this can be distribution, not accumulation',
+      );
+    }
+  } else {
+    if (price.drawdownFromPeak > t.maxDrawdownFromPeak) {
+      fail('drawdown',
+        `already ${pct(price.drawdownFromPeak)} below its recent high — the move played out without you`,
+      );
+    }
+    if (price.phase === 'parabolic') {
+      warnings.push('price is vertical right now — buying here is buying someone else\'s exit');
+    }
   }
 
   if (t.metaTerms.length > 0) {
@@ -245,7 +278,9 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
   }
 
-  const { score, reasons } = scoreMomentum(enriched);
+  const { score, reasons } = t.earlyMode
+    ? scoreEarly(accumulation, c.priceChange, holders?.top10Share ?? null)
+    : scoreMomentum(enriched);
   return { enriched, fails, failCodes, warnings, score, reasons };
 }
 
