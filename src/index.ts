@@ -21,7 +21,7 @@ import { deriveAccumulation } from './accumulation.ts';
 import { renderDetail, renderRejected, renderReview, renderTable } from './render.ts';
 import { isBlocked, loadState, logAlert, pruneState, recordVerdict, saveState } from './watch.ts';
 import { LaunchFeed, toWebSocketUrl } from './launchfeed.ts';
-import { buildOutcomes, fetchCurrentCaps, parseAlertLog, summarise } from './review.ts';
+import { buildOutcomes, dedupeByToken, fetchCurrentCaps, parseAlertLog, summarise } from './review.ts';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import type { Candidate, Enriched, LpStatus, MintSafety, Verdict } from './types.ts';
@@ -495,7 +495,9 @@ async function runReview(opts: Options) {
     console.error(`No alert log at ${opts.alertLog}. Run watch mode first.`);
     process.exit(1);
   }
-  const alerts = parseAlertLog(contents);
+  // Score tokens, not log lines: overlapping watcher restarts append the same
+  // token more than once, and a winner logged three times is still one call.
+  const alerts = dedupeByToken(parseAlertLog(contents));
   const caps = await fetchCurrentCaps([...new Set(alerts.map((a) => a.mint))]);
   const outcomes = buildOutcomes(alerts, caps, Date.now());
   const stats = summarise(outcomes);

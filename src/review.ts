@@ -55,6 +55,23 @@ export function parseAlertLog(contents: string): AlertRecord[] {
 }
 
 /**
+ * One row per token, keeping the earliest call.
+ *
+ * Overlapping watcher processes — a restart while the old one was mid-cycle —
+ * append the same token more than once. Scored as written, a single winner
+ * logged three times counts as three wins and pulls the median up. This is the
+ * tool grading itself, so the count has to be of tokens, not of log lines.
+ */
+export function dedupeByToken(alerts: AlertRecord[]): AlertRecord[] {
+  const earliest = new Map<string, AlertRecord>();
+  for (const alert of alerts) {
+    const incumbent = earliest.get(alert.mint);
+    if (!incumbent || Date.parse(alert.at) < Date.parse(incumbent.at)) earliest.set(alert.mint, alert);
+  }
+  return [...earliest.values()];
+}
+
+/**
  * Pick the market cap to judge a token by: the one on its deepest pool, which
  * is the pair anyone would actually trade through.
  */

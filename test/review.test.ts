@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildOutcomes, currentCaps, parseAlertLog, summarise } from '../src/review.ts';
+import { buildOutcomes, currentCaps, dedupeByToken, parseAlertLog, summarise } from '../src/review.ts';
 
 test('a malformed or truncated line is skipped, not thrown on', () => {
   // The watcher can be killed mid-write, leaving a half-line.
@@ -98,4 +98,29 @@ test('an empty log scores nothing rather than dividing by zero', () => {
   const stats = summarise(buildOutcomes([], new Map(), Date.now()));
   assert.equal(stats.total, 0);
   assert.equal(stats.median, null);
+});
+
+test('the same token logged repeatedly counts once, at its earliest call', () => {
+  // Overlapping watcher restarts appended one winner three times; scored as
+  // written it read as three wins and pulled the median up.
+  const alerts = parseAlertLog([
+    JSON.stringify({ at: '2026-08-09T10:26:00Z', mint: 'bark', marketCapUsd: 177_400, score: 57 }),
+    JSON.stringify({ at: '2026-08-09T10:25:00Z', mint: 'bark', marketCapUsd: 173_200, score: 56 }),
+    JSON.stringify({ at: '2026-08-09T10:26:30Z', mint: 'bark', marketCapUsd: 173_200, score: 56 }),
+    JSON.stringify({ at: '2026-08-09T10:59:00Z', mint: 'other', marketCapUsd: 90_000 }),
+  ].join('\n'));
+
+  const deduped = dedupeByToken(alerts);
+  assert.equal(deduped.length, 2);
+  const bark = deduped.find((a) => a.mint === 'bark');
+  assert.equal(bark?.at, '2026-08-09T10:25:00Z', 'the earliest call is the one that counts');
+  assert.equal(bark?.marketCapUsd, 173_200);
+});
+
+test('deduping a log with no repeats changes nothing', () => {
+  const alerts = parseAlertLog([
+    JSON.stringify({ at: '2026-08-09T10:00:00Z', mint: 'a', marketCapUsd: 1 }),
+    JSON.stringify({ at: '2026-08-09T10:01:00Z', mint: 'b', marketCapUsd: 1 }),
+  ].join('\n'));
+  assert.equal(dedupeByToken(alerts).length, 2);
 });
