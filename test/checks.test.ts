@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 
 import { evaluate, matchMeta, scoreMomentum, volumeToLiquidity, buyPressure, WEIGHTS } from '../src/checks.ts';
 import { decodeMint } from '../src/solana.ts';
-import { DEFAULT_THRESHOLDS } from '../src/config.ts';
+import { DEFAULT_THRESHOLDS, PRESETS } from '../src/config.ts';
 import type {
   BundleAnalysis, Candidate, Enriched, FundingAnalysis, HolderConcentration, LpStatus, MintSafety,
   TokenPresence,
 } from '../src/types.ts';
 import { derivePriceContext } from '../src/phase.ts';
+import { deriveAccumulation } from '../src/accumulation.ts';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -130,6 +131,11 @@ function enriched(overrides: Partial<Enriched> = {}): Enriched {
     bundle: bundle(),
     funding: funding(),
     price: derivePriceContext((overrides.candidate ?? candidate()).priceChange),
+    accumulation: deriveAccumulation(
+      (overrides.candidate ?? candidate()).volume,
+      (overrides.candidate ?? candidate()).txns,
+      (overrides.candidate ?? candidate()).priceChange,
+    ),
     onchainError: null,
     ...overrides,
   };
@@ -471,6 +477,57 @@ test('matchMeta is case-insensitive across name and symbol', () => {
   assert.deepEqual(matchMeta('Giga Chad AI', 'GCAI', ['ai', 'dog']), ['ai']);
   assert.deepEqual(matchMeta('Plain', 'WIF', ['WIF']), ['WIF']);
   assert.deepEqual(matchMeta('Plain', 'PLN', ['cat']), []);
+});
+
+// --- early mode -------------------------------------------------------------
+
+// The shipped preset, not a hand-rolled copy of it.
+const EARLY = { ...DEFAULT_THRESHOLDS, ...PRESETS.early };
+
+test('early mode rejects a token that already pumped and dumped', () => {
+  // The gap this closes: a faded token's 1h change is negative, so the
+  // already-moved gate never fires and its bounce reads as accumulation.
+  // Caught live on a token down 45% from its high that scored on
+  // "buying up 15pts in 5m" — a dead-cat bounce, not an entry.
+  const dumped = candidate({
+    priceChange: { m5: 2, h1: -45.5, h6: -38, h24: -38 },
+    volume: { m5: 4_000, h1: 44_800, h6: 100_000, h24: 243_300 },
+  });
+  const text = evaluate(enriched({ candidate: dumped }), EARLY).fails.join(' | ');
+  assert.match(text, /this move already happened|peaked and faded/);
+});
+
+test('early mode rejects a token whose move already started', () => {
+  const running = candidate({
+    priceChange: { m5: 5, h1: 180, h6: 220, h24: 220 },
+    volume: { m5: 900, h1: 3_600, h6: 20_000, h24: 60_000 },
+  });
+  assert.match(evaluate(enriched({ candidate: running }), EARLY).fails.join(' | '), /move started without you/);
+});
+
+test('early mode keeps a flat token that is accelerating', () => {
+  const coiled = candidate({
+    // Early mode caps size as well as movement — a $900k cap is not pre-pump.
+    marketCap: 120_000,
+    fdv: 120_000,
+    liquidityUsd: 15_000,
+    ageMinutes: 25,
+    priceChange: { m5: 1, h1: 8, h6: 12, h24: 20 },
+    volume: { m5: 900, h1: 3_600, h6: 20_000, h24: 60_000 },
+    txns: {
+      m5: { buys: 30, sells: 10 }, h1: { buys: 120, sells: 110 },
+      h6: { buys: 600, sells: 550 }, h24: { buys: 900, sells: 800 },
+    },
+  });
+  assert.deepEqual(evaluate(enriched({ candidate: coiled }), EARLY).fails, []);
+});
+
+test('early mode rejects a token where nothing is picking up', () => {
+  const flat = candidate({
+    priceChange: { m5: 0, h1: 2, h6: 3, h24: 5 },
+    volume: { m5: 200, h1: 3_600, h6: 20_000, h24: 60_000 },
+  });
+  assert.match(evaluate(enriched({ candidate: flat }), EARLY).fails.join(' | '), /nothing is picking up/);
 });
 
 // --- scoring ----------------------------------------------------------------

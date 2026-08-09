@@ -242,6 +242,19 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     if (c.priceChange.h6 > t.maxPriceChangeH6) {
       fail('already-moved', `already +${c.priceChange.h6.toFixed(0)}% over 6h — not pre-pump any more`);
     }
+    // "Pre-pump" means the move has not happened — not that it happened and
+    // reversed. Without this, a token that ran and dumped sails through: its
+    // 1h change is negative so the already-moved gate never fires, and the
+    // bounce reads as accumulation. Caught live on a token down 45% from its
+    // peak that scored as "buying up 15pts in 5m".
+    if (price.drawdownFromPeak > t.maxDrawdownFromPeak) {
+      fail('drawdown',
+        `already ${pct(price.drawdownFromPeak)} below its recent high — this move already happened`,
+      );
+    }
+    if (price.phase === 'faded') {
+      fail('drawdown', 'price peaked and faded — a bounce off the bottom is not accumulation');
+    }
     if (accumulation.volumeAcceleration === null) {
       fail('no-acceleration', 'five-minute window too thin to tell whether anything is picking up');
     } else if (accumulation.volumeAcceleration < t.minVolumeAcceleration) {

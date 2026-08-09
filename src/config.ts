@@ -112,6 +112,40 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   allowUnknownLiquidity: false,
 };
 
+/**
+ * Named presets, defined here rather than inline in the CLI so that what ships
+ * and what the tests exercise cannot drift apart.
+ */
+export const PRESETS: Record<string, Partial<Thresholds>> = {
+  /** Newly-launched hunt: young, small, and not already well off its high. */
+  fresh: {
+    minAgeMinutes: 30,
+    maxAgeHours: 12,
+    maxMarketCapUsd: 1_000_000,
+    maxFdvUsd: 1_000_000,
+    minLiquidityUsd: 20_000,
+    maxDrawdownFromPeak: 0.3,
+  },
+  /**
+   * Pre-pump hunt. Every floor drops, because the evidence the default gates
+   * demand is exactly the evidence that the move already started.
+   */
+  early: {
+    earlyMode: true,
+    minAgeMinutes: 10,
+    maxAgeHours: 6,
+    minLiquidityUsd: 8_000,
+    minMarketCapUsd: 15_000,
+    maxMarketCapUsd: 300_000,
+    maxFdvUsd: 300_000,
+    minVolumeH1Usd: 3_000,
+    minTxnsH1: 25,
+    // Tighter than default: a pre-pump call on something already well off its
+    // high is a contradiction.
+    maxDrawdownFromPeak: 0.25,
+  },
+};
+
 /** Solana System Program. A token account owner owned by this is a genuine user wallet. */
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 

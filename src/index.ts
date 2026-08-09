@@ -8,7 +8,7 @@
 // on-chain verification only for what survives. On-chain calls are the
 // expensive part and most candidates die on liquidity or volume anyway.
 
-import { DEFAULT_THRESHOLDS, loadEnv, type Thresholds } from './config.ts';
+import { DEFAULT_THRESHOLDS, PRESETS, loadEnv, type Thresholds } from './config.ts';
 import { discoverMints, fetchOne, fetchPairs } from './dexscreener.ts';
 import { evaluate } from './checks.ts';
 import { SolanaRpc, fetchMintSafety, resolveHoldings, summariseConcentration } from './solana.ts';
@@ -100,31 +100,10 @@ function parseArgs(argv: string[]): Options {
       case '--max-drawdown': t.maxDrawdownFromPeak = Number(next()) / 100; break;
       case '--meta': t.metaTerms = (next() ?? '').split(',').map((s) => s.trim()).filter(Boolean); break;
       case '--meta-only': t.metaOnly = true; break;
-      case '--early':
-        // Pre-pump hunt. Every floor drops, because the evidence the default
-        // gates demand is exactly the evidence that the move already started.
-        t.earlyMode = true;
-        t.minAgeMinutes = 10;
-        t.maxAgeHours = 6;
-        t.minLiquidityUsd = 8_000;
-        t.minMarketCapUsd = 15_000;
-        t.maxMarketCapUsd = 300_000;
-        t.maxFdvUsd = 300_000;
-        t.minVolumeH1Usd = 3_000;
-        t.minTxnsH1 = 25;
-        break;
+      case '--early': Object.assign(t, PRESETS.early); break;
       case '--max-move': t.maxPriceChangeH1 = Number(next()); break;
       case '--min-accel': t.minVolumeAcceleration = Number(next()); break;
-      case '--fresh':
-        // Preset for catching launches early: younger, smaller, and stricter
-        // about the move not having happened yet.
-        t.minAgeMinutes = 30;
-        t.maxAgeHours = 12;
-        t.maxMarketCapUsd = 1_000_000;
-        t.maxFdvUsd = 1_000_000;
-        t.minLiquidityUsd = 20_000;
-        t.maxDrawdownFromPeak = 0.3;
-        break;
+      case '--fresh': Object.assign(t, PRESETS.fresh); break;
       case '--help': case '-h': printHelp(); process.exit(0);
       default:
         if (arg.startsWith('--')) {
