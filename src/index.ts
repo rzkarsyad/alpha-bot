@@ -18,9 +18,11 @@ import { analyzeFunders } from './funding.ts';
 import { applyOrders, fetchOrders } from './presence.ts';
 import { derivePriceContext } from './phase.ts';
 import { deriveAccumulation } from './accumulation.ts';
-import { renderDetail, renderRejected, renderTable } from './render.ts';
+import { renderDetail, renderRejected, renderReview, renderTable } from './render.ts';
 import { isBlocked, loadState, logAlert, pruneState, recordVerdict, saveState } from './watch.ts';
 import { LaunchFeed, toWebSocketUrl } from './launchfeed.ts';
+import { buildOutcomes, fetchCurrentCaps, parseAlertLog, summarise } from './review.ts';
+import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import type { Candidate, Enriched, LpStatus, MintSafety, Verdict } from './types.ts';
 
@@ -30,6 +32,7 @@ type Options = {
   json: boolean;
   limit: number;
   watchSeconds: number | null;
+  review: boolean;
   notify: boolean;
   launchFeed: boolean;
   statePath: string;
@@ -47,6 +50,7 @@ function parseArgs(argv: string[]): Options {
     json: false,
     limit: 15,
     watchSeconds: null,
+    review: false,
     notify: false,
     launchFeed: true,
     statePath: 'out/watch-state.json',
@@ -68,6 +72,7 @@ function parseArgs(argv: string[]): Options {
         opts.watchSeconds = peek && !peek.startsWith('--') ? Number(next()) : 90;
         break;
       }
+      case '--review': opts.review = true; break;
       case '--notify': opts.notify = true; break;
       case '--no-launch-feed': opts.launchFeed = false; break;
       case '--state': opts.statePath = next(); break;
@@ -126,6 +131,7 @@ Flags
   --token <mint>        Full due-diligence report on one token
   --show-rejected [n]   List what was rejected and why (default 20)
   --json                Machine-readable output
+  --review              Score past alerts by market cap: did the calls work?
   --limit <n>           Max results to print (default 15)
 
 Watch mode — poll continuously, alert only on tokens that newly clear
@@ -480,6 +486,23 @@ async function runToken(mint: string, opts: Options, rpc: SolanaRpc) {
   else console.log(renderDetail(verdict));
 }
 
+/** Score the tool against its own past calls. */
+async function runReview(opts: Options) {
+  let contents = '';
+  try {
+    contents = readFileSync(opts.alertLog, 'utf8');
+  } catch {
+    console.error(`No alert log at ${opts.alertLog}. Run watch mode first.`);
+    process.exit(1);
+  }
+  const alerts = parseAlertLog(contents);
+  const caps = await fetchCurrentCaps([...new Set(alerts.map((a) => a.mint))]);
+  const outcomes = buildOutcomes(alerts, caps, Date.now());
+  const stats = summarise(outcomes);
+  if (opts.json) console.log(JSON.stringify({ outcomes, stats }, null, 2));
+  else console.log(renderReview(outcomes, stats));
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const { rpcUrl, throttleMs, usingPublicRpc } = loadEnv();
@@ -493,6 +516,7 @@ async function main() {
   }
 
   const rpc = new SolanaRpc(rpcUrl, throttleMs);
+  if (opts.review) return runReview(opts);
   if (opts.token) await runToken(opts.token, opts, rpc);
   else if (opts.watchSeconds !== null) await runWatch(opts, rpc, rpcUrl);
   else await runScan(opts, rpc);

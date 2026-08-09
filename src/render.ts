@@ -3,6 +3,7 @@
 import { pct, usd, volumeToLiquidity, buyPressure } from './checks.ts';
 import { presenceBadge } from './presence.ts';
 import type { LpStatus, PriceContext, TokenPresence, Verdict } from './types.ts';
+import type { Outcome, summarise } from './review.ts';
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code: string) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -277,4 +278,50 @@ export function formatAge(minutes: number): string {
   if (minutes < 60) return `${Math.round(minutes)}m`;
   if (minutes < 60 * 24) return `${(minutes / 60).toFixed(1)}h`;
   return `${(minutes / 1440).toFixed(1)}d`;
+}
+
+/** Scorecard for the tool's own past calls. */
+export function renderReview(outcomes: Outcome[], stats: ReturnType<typeof summarise>): string {
+  if (outcomes.length === 0) {
+    return yellow('\nNo alerts logged yet — nothing to score.\n');
+  }
+  const lines: string[] = [''];
+  lines.push(
+    bold(pad('WHEN', 8) + pad('TICKER', 12) + pad('SCORE', 7) + pad('MC THEN', 10) + pad('MC NOW', 10) +
+      pad('CHANGE', 9) + pad('SINCE', 8) + 'CA'),
+  );
+  lines.push(dim('─'.repeat(100)));
+
+  for (const o of [...outcomes].sort((a, b) => Date.parse(b.alert.at) - Date.parse(a.alert.at))) {
+    const change = o.change === null
+      ? dim('  n/a')
+      : (o.change > 0.2 ? green : o.change < -0.2 ? red : yellow)(
+          `${o.change >= 0 ? '+' : ''}${(o.change * 100).toFixed(0)}%`,
+        );
+    lines.push(
+      pad(o.alert.at.slice(11, 16), 8) +
+        pad(cyan((o.alert.symbol ?? '?').slice(0, 10)), 12) +
+        pad(String(o.alert.score ?? '—'), 7) +
+        pad(o.alert.marketCapUsd ? usd(o.alert.marketCapUsd) : dim('n/a'), 10) +
+        pad(o.marketCapNow === null ? red('delisted') : usd(o.marketCapNow), 10) +
+        pad(change, 9) +
+        pad(formatAge(o.minutesSince), 8) +
+        dim(o.alert.mint),
+    );
+  }
+
+  lines.push('');
+  lines.push(bold('Scorecard'));
+  lines.push(`  calls          ${stats.total} (${stats.scored} still listed, ${stats.dead} delisted)`);
+  lines.push(`  up >20%        ${stats.up}`);
+  lines.push(`  flat ±20%      ${stats.flat}`);
+  lines.push(`  down >20%      ${stats.down}`);
+  lines.push(
+    `  median change  ${stats.median === null ? 'n/a' : `${stats.median >= 0 ? '+' : ''}${(stats.median * 100).toFixed(0)}%`}`,
+  );
+  lines.push('');
+  lines.push(dim('Market cap, not percentage change. A new token trades first near zero, so'));
+  lines.push(dim('its lifetime "change" reads in the hundreds of percent before it is worth'));
+  lines.push(dim('anything — on one call here, "+1117%" was a market cap moving $38.8k to $42.2k.'));
+  return lines.join('\n');
 }
