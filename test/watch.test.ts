@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  emptyState, isBlocked, loadState, logAlert, permanentFail, pruneState,
+  emptyState, isBlocked, isUnverified, loadState, logAlert, permanentFail, pruneState,
   recordVerdict, saveState, STATE_VERSION,
 } from '../src/watch.ts';
 import type { FailCode, Verdict } from '../src/types.ts';
@@ -36,7 +36,14 @@ function verdict(mint: string, failCodes: FailCode[] = [], score = 70): Verdict 
           h6: { buys: 0, sells: 0 }, h24: { buys: 0, sells: 0 },
         },
       },
-      safety: null, holders: null, lp: null, bundle: null, funding: null,
+      // Non-null: a verdict with no mint read is treated as unverified and
+      // never alerts, so the baseline fixture has to represent a real check.
+      safety: {
+        mint, isToken2022: false, mintAuthority: null, freezeAuthority: null, decimals: 6,
+        supplyRaw: 1_000_000n, transferFeeBps: 0, transferHookProgram: null,
+        permanentDelegate: null, defaultStateFrozen: false,
+      },
+      holders: null, lp: null, bundle: null, funding: null,
       price: { drawdownFromPeak: 0.05, phase: 'running' },
       accumulation: {
         volumeAcceleration: 2.4, tradeAcceleration: 2.1, buyPressureShift: 0.08, coiled: true,
@@ -203,4 +210,39 @@ test('each alert appends one JSON line carrying the contract address', () => {
   assert.equal(first.priorMoveH6, 320, 'the move it had already made elsewhere');
   assert.equal(first.volumeAcceleration, 2.4);
   assert.equal(first.coiled, true);
+});
+
+// --- unverified verdicts ----------------------------------------------------
+
+function unverified(mint: string): Verdict {
+  const v = verdict(mint);
+  // What an exhausted RPC quota produces: market gates passed, nothing read.
+  return { ...v, enriched: { ...v.enriched, safety: null, holders: null, lp: null, bundle: null } };
+}
+
+test('a token that passed only the market gates never alerts', () => {
+  // It looks identical to a fully-checked pass at the moment you act on it.
+  const state = emptyState();
+  assert.equal(recordVerdict(state, unverified('A'), 1000, COOLDOWN), false);
+  assert.equal('A' in state.alerted, false);
+});
+
+test('a suppressed token still alerts once the chain can be read again', () => {
+  // It must not burn its cooldown on an evaluation that verified nothing.
+  const state = emptyState();
+  recordVerdict(state, unverified('B'), 1000, COOLDOWN);
+  assert.equal(recordVerdict(state, verdict('B'), 2000, COOLDOWN), true);
+});
+
+test('a verified pass is unaffected', () => {
+  const state = emptyState();
+  assert.equal(recordVerdict(state, verdict('C'), 1000, COOLDOWN), true);
+});
+
+test('a permanent rejection is still remembered even when unverified', () => {
+  // Bundling is read from the market side too; a real fail is a real fail.
+  const state = emptyState();
+  const v = unverified('D');
+  recordVerdict(state, { ...v, fails: ['bundled'], failCodes: ['bundled-launch'] }, 1000, COOLDOWN);
+  assert.equal(isBlocked(state, 'D'), true);
 });

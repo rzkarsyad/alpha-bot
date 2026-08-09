@@ -83,6 +83,21 @@ export function shouldAlert(state: WatchState, mint: string, now: number, cooldo
   return last === undefined || now - last >= cooldownMs;
 }
 
+/**
+ * True when a verdict rests on nothing: the mint was never read, so no
+ * authority, distribution, bundle or LP check actually ran.
+ *
+ * Such a token "passes" only the market filters, yet the alert it produces
+ * looks identical to one backed by every on-chain gate. When an RPC quota ran
+ * out mid-session that is exactly what happened — a token cleared with four
+ * "unverified" warnings and no verification behind it. An alert that checked
+ * nothing is worse than no alert, because it is indistinguishable from a real
+ * one at the moment you act on it.
+ */
+export function isUnverified(verdict: Verdict): boolean {
+  return verdict.enriched.safety === null;
+}
+
 /** Record a verdict against the state. Returns whether it produced an alert. */
 export function recordVerdict(
   state: WatchState,
@@ -98,6 +113,10 @@ export function recordVerdict(
     if (code) state.blocked[mint] = { at: now, code };
     return false;
   }
+
+  // Not recorded as alerted either: once the RPC recovers this token deserves a
+  // real evaluation rather than being suppressed by a cooldown it never earned.
+  if (isUnverified(verdict)) return false;
 
   if (!shouldAlert(state, mint, now, cooldownMs)) return false;
   state.alerted[mint] = now;
