@@ -10,11 +10,19 @@
 
 import type { Thresholds } from './config.ts';
 import { isBare } from './presence.ts';
-import type { Enriched, Verdict } from './types.ts';
+import type { Enriched, FailCode, Verdict } from './types.ts';
 
 export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   const fails: string[] = [];
+  // Codes run parallel to the messages so callers can reason about *which* gate
+  // failed without parsing prose. Watch mode needs this to tell a permanent
+  // rejection from one that a token could grow out of.
+  const failCodes: string[] = [];
   const warnings: string[] = [];
+  const fail = (code: FailCode, message: string) => {
+    failCodes.push(code);
+    fails.push(message);
+  };
   const { candidate: c, safety, holders } = enriched;
 
   // --- Stage 1: on-chain kill switches -------------------------------------
@@ -22,27 +30,27 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   // failed" or "we have not looked yet". `onchainError` disambiguates, which
   // lets the caller run a cheap market-only pass before spending RPC calls.
   if (!safety && enriched.onchainError !== null) {
-    fails.push(`mint account could not be read — ${enriched.onchainError}`);
+    fail('mint-unreadable', `mint account could not be read — ${enriched.onchainError}`);
   } else if (safety) {
     if (safety.mintAuthority) {
-      fails.push(`mint authority still live (${short(safety.mintAuthority)}) — supply can be printed`);
+      fail('mint-authority', `mint authority still live (${short(safety.mintAuthority)}) — supply can be printed`);
     }
     if (safety.freezeAuthority) {
-      fails.push(`freeze authority still live (${short(safety.freezeAuthority)}) — your wallet can be frozen`);
+      fail('freeze-authority', `freeze authority still live (${short(safety.freezeAuthority)}) — your wallet can be frozen`);
     }
     if (safety.permanentDelegate) {
-      fails.push(
+      fail('permanent-delegate', 
         `permanent delegate set (${short(safety.permanentDelegate)}) — tokens can be taken from your wallet`,
       );
     }
     if (safety.transferHookProgram) {
-      fails.push(`transfer hook installed (${short(safety.transferHookProgram)}) — transfers run arbitrary code`);
+      fail('transfer-hook', `transfer hook installed (${short(safety.transferHookProgram)}) — transfers run arbitrary code`);
     }
     if (safety.transferFeeBps > t.maxTransferFeeBps) {
-      fails.push(`transfer tax of ${(safety.transferFeeBps / 100).toFixed(2)}% on every trade`);
+      fail('transfer-tax', `transfer tax of ${(safety.transferFeeBps / 100).toFixed(2)}% on every trade`);
     }
     if (safety.defaultStateFrozen) {
-      fails.push('new token accounts default to frozen — buyers may be unable to sell');
+      fail('default-frozen', 'new token accounts default to frozen — buyers may be unable to sell');
     }
   }
 
@@ -54,12 +62,12 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
   } else {
     if (holders.top10Share > t.maxTop10Share) {
-      fails.push(
+      fail('top10', 
         `top 10 wallets hold ${pct(holders.top10Share)} of float (limit ${pct(t.maxTop10Share)})`,
       );
     }
     if (holders.top1Share > t.maxTop1Share) {
-      fails.push(`single wallet holds ${pct(holders.top1Share)} of float (limit ${pct(t.maxTop1Share)})`);
+      fail('top1', `single wallet holds ${pct(holders.top1Share)} of float (limit ${pct(t.maxTop1Share)})`);
     }
     if (holders.countedWallets < 5) {
       warnings.push(`only ${holders.countedWallets} non-pool wallets in the top 20 — thin distribution`);
@@ -80,7 +88,7 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
   } else {
     if (bundle.clusteredShare > t.maxClusteredShare) {
-      fails.push(
+      fail('bundled-launch', 
         `${pct(bundle.clusteredShare)} of float sits in ${bundle.largestSlotCluster} wallets created in one slot` +
           (bundle.clusterSlot === null ? '' : ` (slot ${bundle.clusterSlot})`) +
           ` — bundled launch (limit ${pct(t.maxClusteredShare)})`,
@@ -109,7 +117,7 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
   } else {
     if (funding.sharedFunderShare > t.maxSharedFunderShare) {
-      fails.push(
+      fail('shared-funder', 
         `${pct(funding.sharedFunderShare)} of float sits in ${funding.topFunderWallets} wallets funded by one address` +
           (funding.topFunder === null ? '' : ` (${short(funding.topFunder)})`) +
           ` — one entity behind many wallets (limit ${pct(t.maxSharedFunderShare)})`,
@@ -137,11 +145,11 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
   } else if (!lp.supported) {
     const message = `LP not verifiable: ${lp.reason}`;
-    if (t.requireVerifiableLp) fails.push(message);
+    if (t.requireVerifiableLp) fail('lp-unverifiable', message);
     else warnings.push(message);
   } else {
     if (lp.largestPullableShare > t.maxSingleLpHolderShare) {
-      fails.push(
+      fail('lp-pullable', 
         `one wallet holds ${pct(lp.largestPullableShare)} of LP (limit ${pct(t.maxSingleLpHolderShare)}) — it can pull that liquidity`,
       );
     }
@@ -164,43 +172,43 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     warnings.push('pair creation time unknown');
   } else if (c.ageMinutes < t.minAgeMinutes) {
     // Floor, not round: at 29.6 minutes, "only 30m old (minimum 30m)" reads as a bug.
-    fails.push(`only ${Math.floor(c.ageMinutes)}m old (minimum ${t.minAgeMinutes}m)`);
+    fail('age-young', `only ${Math.floor(c.ageMinutes)}m old (minimum ${t.minAgeMinutes}m)`);
   } else if (c.ageMinutes > t.maxAgeHours * 60) {
-    fails.push(`${(c.ageMinutes / 60).toFixed(0)}h old — outside the early window`);
+    fail('age-old', `${(c.ageMinutes / 60).toFixed(0)}h old — outside the early window`);
   }
 
   if (c.liquidityUsd === null) {
     if (!t.allowUnknownLiquidity) {
-      fails.push('no liquidity reported (pre-graduation bonding curve) — cannot size an exit');
+      fail('liquidity-unknown', 'no liquidity reported (pre-graduation bonding curve) — cannot size an exit');
     } else {
       warnings.push('liquidity unknown — bonding curve pricing, exits are not guaranteed');
     }
   } else if (c.liquidityUsd < t.minLiquidityUsd) {
-    fails.push(`liquidity ${usd(c.liquidityUsd)} below ${usd(t.minLiquidityUsd)} — you cannot exit cleanly`);
+    fail('liquidity-thin', `liquidity ${usd(c.liquidityUsd)} below ${usd(t.minLiquidityUsd)} — you cannot exit cleanly`);
   }
 
   if (c.fdv !== null && c.fdv > t.maxFdvUsd) {
-    fails.push(`FDV ${usd(c.fdv)} above ${usd(t.maxFdvUsd)} — not early any more`);
+    fail('fdv', `FDV ${usd(c.fdv)} above ${usd(t.maxFdvUsd)} — not early any more`);
   }
   if (c.marketCap !== null) {
     if (c.marketCap < t.minMarketCapUsd) {
-      fails.push(`market cap ${usd(c.marketCap)} below ${usd(t.minMarketCapUsd)} — nothing to sell into`);
+      fail('market-cap-low', `market cap ${usd(c.marketCap)} below ${usd(t.minMarketCapUsd)} — nothing to sell into`);
     } else if (c.marketCap > t.maxMarketCapUsd) {
-      fails.push(`market cap ${usd(c.marketCap)} above ${usd(t.maxMarketCapUsd)} — the move already happened`);
+      fail('market-cap-high', `market cap ${usd(c.marketCap)} above ${usd(t.maxMarketCapUsd)} — the move already happened`);
     }
   }
   if (c.volume.h1 < t.minVolumeH1Usd) {
-    fails.push(`1h volume ${usd(c.volume.h1)} below ${usd(t.minVolumeH1Usd)} — no real flow`);
+    fail('volume', `1h volume ${usd(c.volume.h1)} below ${usd(t.minVolumeH1Usd)} — no real flow`);
   }
 
   const txnsH1 = c.txns.h1.buys + c.txns.h1.sells;
   if (txnsH1 < t.minTxnsH1) {
-    fails.push(`only ${txnsH1} trades in the last hour — too few participants`);
+    fail('txns', `only ${txnsH1} trades in the last hour — too few participants`);
   }
 
   const volLiq = volumeToLiquidity(c.volume.h24, c.liquidityUsd);
   if (volLiq !== null && volLiq > t.maxVolumeToLiquidityRatio) {
-    fails.push(`24h volume is ${volLiq.toFixed(0)}x liquidity — consistent with wash trading`);
+    fail('wash-trading', `24h volume is ${volLiq.toFixed(0)}x liquidity — consistent with wash trading`);
   }
 
   // --- Stage 5: presentation and timing -------------------------------------
@@ -208,21 +216,21 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   // obviously-throwaway tokens before any RPC budget is spent on them.
   const p = c.presence;
   if (t.requirePresence && isBare(p)) {
-    fails.push('no profile, no socials, no boosts, nothing paid — nobody invested anything in this');
+    fail('presence-bare', 'no profile, no socials, no boosts, nothing paid — nobody invested anything in this');
   }
   if (p.socials.length < t.minSocials) {
     const message = `${p.socials.length} social account(s) linked (want ${t.minSocials})`;
-    if (t.minSocials > 0 && p.socials.length === 0) fails.push(`${message} — no way to follow the project`);
+    if (t.minSocials > 0 && p.socials.length === 0) fail('no-socials', `${message} — no way to follow the project`);
     else warnings.push(message);
   }
   if (t.requireDexPaid) {
     if (!p.ordersChecked) warnings.push('DexScreener paid status not checked');
-    else if (p.paidOrders.length === 0) fails.push('nothing paid to DexScreener — no skin in the game');
+    else if (p.paidOrders.length === 0) fail('not-paid', 'nothing paid to DexScreener — no skin in the game');
   }
 
   const price = enriched.price;
   if (price.drawdownFromPeak > t.maxDrawdownFromPeak) {
-    fails.push(
+    fail('drawdown', 
       `already ${pct(price.drawdownFromPeak)} below its recent high — the move played out without you`,
     );
   }
@@ -233,12 +241,12 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   if (t.metaTerms.length > 0) {
     const matched = matchMeta(c.name, c.symbol, t.metaTerms);
     if (matched.length === 0 && t.metaOnly) {
-      fails.push(`no match for meta terms (${t.metaTerms.join(', ')})`);
+      fail('meta', `no match for meta terms (${t.metaTerms.join(', ')})`);
     }
   }
 
   const { score, reasons } = scoreMomentum(enriched);
-  return { enriched, fails, warnings, score, reasons };
+  return { enriched, fails, failCodes, warnings, score, reasons };
 }
 
 /**

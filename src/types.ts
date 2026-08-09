@@ -172,10 +172,35 @@ export type Enriched = {
   onchainError: string | null;
 };
 
+/** Stable identifier for each gate, so callers need not parse failure prose. */
+export type FailCode =
+  | 'mint-unreadable' | 'mint-authority' | 'freeze-authority' | 'permanent-delegate'
+  | 'transfer-hook' | 'transfer-tax' | 'default-frozen'
+  | 'top10' | 'top1' | 'bundled-launch' | 'shared-funder'
+  | 'lp-unverifiable' | 'lp-pullable'
+  | 'age-young' | 'age-old' | 'liquidity-unknown' | 'liquidity-thin'
+  | 'fdv' | 'market-cap-low' | 'market-cap-high' | 'volume' | 'txns' | 'wash-trading'
+  | 'presence-bare' | 'no-socials' | 'not-paid' | 'drawdown' | 'meta';
+
+/**
+ * Gates a token can never grow out of, because they describe history rather
+ * than current conditions. A watcher can stop re-checking these permanently;
+ * everything else may change with the next candle.
+ */
+export const PERMANENT_FAILS: ReadonlySet<FailCode> = new Set<FailCode>([
+  // How the supply was acquired at launch is a fixed historical fact.
+  'bundled-launch',
+  'shared-funder',
+  // A token only gets older.
+  'age-old',
+]);
+
 export type Verdict = {
   enriched: Enriched;
   /** Non-empty means the token failed a kill switch and is not tradeable under these rules. */
   fails: string[];
+  /** Codes parallel to `fails`, same order. */
+  failCodes: FailCode[];
   /** Non-blocking concerns worth reading before sizing a position. */
   warnings: string[];
   /** 0..100 momentum score. Only meaningful when `fails` is empty. */

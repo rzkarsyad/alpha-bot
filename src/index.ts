@@ -18,6 +18,8 @@ import { analyzeFunders } from './funding.ts';
 import { applyOrders, fetchOrders } from './presence.ts';
 import { derivePriceContext } from './phase.ts';
 import { renderDetail, renderRejected, renderTable } from './render.ts';
+import { isBlocked, loadState, logAlert, pruneState, recordVerdict, saveState } from './watch.ts';
+import { execFileSync } from 'node:child_process';
 import type { Candidate, Enriched, LpStatus, MintSafety, Verdict } from './types.ts';
 
 type Options = {
@@ -25,12 +27,31 @@ type Options = {
   showRejected: number;
   json: boolean;
   limit: number;
+  watchSeconds: number | null;
+  notify: boolean;
+  statePath: string;
+  alertLog: string;
+  alertCooldownMs: number;
+  stateMaxAgeMs: number;
   thresholds: Thresholds;
 };
 
 function parseArgs(argv: string[]): Options {
   const t: Thresholds = { ...DEFAULT_THRESHOLDS };
-  const opts: Options = { token: null, showRejected: 0, json: false, limit: 15, thresholds: t };
+  const opts: Options = {
+    token: null,
+    showRejected: 0,
+    json: false,
+    limit: 15,
+    watchSeconds: null,
+    notify: false,
+    statePath: 'out/watch-state.json',
+    alertLog: 'out/alerts.jsonl',
+    // Long enough that a token hovering on a threshold cannot spam the loop.
+    alertCooldownMs: 6 * 60 * 60 * 1000,
+    stateMaxAgeMs: 7 * 24 * 60 * 60 * 1000,
+    thresholds: t,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -38,6 +59,15 @@ function parseArgs(argv: string[]): Options {
     switch (arg) {
       case '--token': opts.token = next(); break;
       case '--json': opts.json = true; break;
+      case '--watch': {
+        const peek = argv[i + 1];
+        opts.watchSeconds = peek && !peek.startsWith('--') ? Number(next()) : 90;
+        break;
+      }
+      case '--notify': opts.notify = true; break;
+      case '--state': opts.statePath = next(); break;
+      case '--alert-log': opts.alertLog = next(); break;
+      case '--cooldown': opts.alertCooldownMs = Number(next()) * 60_000; break;
       case '--limit': opts.limit = Number(next()); break;
       case '--show-rejected': {
         const peek = argv[i + 1];
@@ -98,6 +128,13 @@ Flags
   --show-rejected [n]   List what was rejected and why (default 20)
   --json                Machine-readable output
   --limit <n>           Max results to print (default 15)
+
+Watch mode — poll continuously, alert only on tokens that newly clear
+  --watch [seconds]     Run on a loop (default 90s between cycles)
+  --notify              macOS desktop notification per alert
+  --state <path>        State file (default out/watch-state.json)
+  --alert-log <path>    JSONL alert log (default out/alerts.jsonl)
+  --cooldown <minutes>  Do not re-alert the same token within this (default 360)
 
 Threshold overrides
   --min-liq <usd>       Minimum liquidity        (default ${DEFAULT_THRESHOLDS.minLiquidityUsd})
@@ -224,15 +261,39 @@ async function enrich(
   return out;
 }
 
-async function runScan(opts: Options, rpc: SolanaRpc) {
-  process.stderr.write('Discovering Solana tokens...\n');
-  const mints = await discoverMints();
-  if (mints.length === 0) {
-    console.error('Discovery returned nothing — DexScreener may be rate-limiting. Retry shortly.');
-    process.exit(1);
-  }
+type ScanResult = {
+  scanned: number;
+  shortlisted: number;
+  /** Fully-evaluated verdicts for everything that cleared the market gates. */
+  verdicts: Verdict[];
+  /** Rejected during the cheap first pass, never enriched. */
+  marketRejected: Verdict[];
+};
 
-  process.stderr.write(`Found ${mints.length} tokens. Fetching market data...\n`);
+/**
+ * One full scan cycle. Extracted from the CLI so watch mode can call it on a
+ * loop without re-implementing the two-pass structure.
+ *
+ * `skip` lets a caller drop mints it has already permanently rejected, which is
+ * where watch mode saves most of its RPC budget.
+ */
+async function scanOnce(
+  rpc: SolanaRpc,
+  thresholds: Thresholds,
+  options: { skip?: (mint: string) => boolean; quiet?: boolean } = {},
+): Promise<ScanResult> {
+  const say = (message: string) => {
+    if (!options.quiet) process.stderr.write(message);
+  };
+
+  say('Discovering Solana tokens...\n');
+  const discovered = await discoverMints();
+  if (discovered.length === 0) throw new Error('discovery returned nothing — DexScreener may be rate-limiting');
+
+  const mints = options.skip ? discovered.filter((m) => !options.skip!(m)) : discovered;
+  say(`Found ${discovered.length} tokens${mints.length !== discovered.length ? ` (${discovered.length - mints.length} already ruled out)` : ''}. Fetching market data...\n`);
+  if (mints.length === 0) return { scanned: 0, shortlisted: 0, verdicts: [], marketRejected: [] };
+
   const candidates = await fetchPairs(mints);
 
   // Pass 1 — market gates only. `onchainError: null` tells evaluate() we have
@@ -245,34 +306,117 @@ async function runScan(opts: Options, rpc: SolanaRpc) {
           price: derivePriceContext(candidate.priceChange), onchainError: null,
         }) satisfies Enriched,
     )
-    .map((enriched) => evaluate(enriched, opts.thresholds));
+    .map((enriched) => evaluate(enriched, thresholds));
 
   const shortlist = prefiltered.filter((v) => v.fails.length === 0);
   const marketRejected = prefiltered.filter((v) => v.fails.length > 0);
 
-  process.stderr.write(
-    `${shortlist.length} of ${candidates.length} passed market gates. Verifying on-chain...\n`,
-  );
+  say(`${shortlist.length} of ${candidates.length} passed market gates. Verifying on-chain...\n`);
 
   // Pass 2 — the checks that actually matter.
-  const enriched = await enrich(rpc, shortlist.map((v) => v.enriched.candidate), opts.thresholds);
-  const verdicts = enriched.map((e) => evaluate(e, opts.thresholds));
+  const enriched = await enrich(rpc, shortlist.map((v) => v.enriched.candidate), thresholds);
+  const verdicts = enriched.map((e) => evaluate(e, thresholds));
 
-  const passed = verdicts.filter((v) => v.fails.length === 0).sort((a, b) => b.score - a.score).slice(0, opts.limit);
+  return { scanned: candidates.length, shortlisted: shortlist.length, verdicts, marketRejected };
+}
+
+async function runScan(opts: Options, rpc: SolanaRpc) {
+  const { scanned, shortlisted, verdicts, marketRejected } = await scanOnce(rpc, opts.thresholds);
+
+  const cleared = verdicts.filter((v) => v.fails.length === 0);
+  const passed = [...cleared].sort((a, b) => b.score - a.score).slice(0, opts.limit);
   const rejected = [...verdicts.filter((v) => v.fails.length > 0), ...marketRejected];
 
   if (opts.json) {
-    console.log(JSON.stringify({ scanned: candidates.length, passed, rejectedCount: rejected.length }, null, 2));
+    console.log(JSON.stringify({ scanned, passed, rejectedCount: rejected.length }, null, 2));
     return;
   }
 
   console.log(renderTable(passed));
   if (opts.showRejected > 0) console.log(renderRejected(rejected, opts.showRejected));
+  console.log(`\nScanned ${scanned} · market gates ${shortlisted} · fully cleared ${cleared.length}\n`);
+}
+
+/** Fire a macOS desktop notification. Never fatal — an alert is not the work. */
+function notify(verdict: Verdict): void {
+  if (process.platform !== 'darwin') return;
+  const c = verdict.enriched.candidate;
+  // Token names come from on-chain data and are untrusted, so strip everything
+  // that could break out of the AppleScript string literal.
+  const safe = (s: string) => s.replace(/[^\w \-.+#$%]/g, '').slice(0, 40);
+  const script =
+    `display notification "${safe(c.mint)}" ` +
+    `with title "${safe(c.symbol)} cleared — score ${verdict.score}" ` +
+    `subtitle "${safe(verdict.enriched.price.phase)}"`;
+  try {
+    execFileSync('osascript', ['-e', script], { stdio: 'ignore', timeout: 5_000 });
+  } catch {
+    // A missing or refused notification must not interrupt the watch loop.
+  }
+}
+
+async function runWatch(opts: Options, rpc: SolanaRpc) {
+  const state = loadState(opts.statePath);
+  let running = true;
+  let cycle = 0;
+
+  const stop = () => {
+    if (!running) return;
+    running = false;
+    saveState(opts.statePath, state);
+    console.log(`\nStopped. State saved to ${opts.statePath}.`);
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+
   console.log(
-    `\nScanned ${candidates.length} · market gates ${shortlist.length} · fully cleared ${
-      verdicts.filter((v) => v.fails.length === 0).length
-    }\n`,
+    `Watching every ${opts.watchSeconds}s. State ${opts.statePath}, alerts ${opts.alertLog}.\n` +
+      `Known: ${Object.keys(state.seen).length} seen, ${Object.keys(state.alerted).length} alerted, ` +
+      `${Object.keys(state.blocked).length} permanently ruled out. Ctrl-C to stop.\n`,
   );
+
+  while (running) {
+    cycle++;
+    const startedAt = Date.now();
+    try {
+      const result = await scanOnce(rpc, opts.thresholds, {
+        skip: (mint) => isBlocked(state, mint),
+        quiet: true,
+      });
+
+      const alerts: Verdict[] = [];
+      for (const verdict of [...result.verdicts, ...result.marketRejected]) {
+        if (recordVerdict(state, verdict, Date.now(), opts.alertCooldownMs)) alerts.push(verdict);
+      }
+      pruneState(state, Date.now(), opts.stateMaxAgeMs);
+      saveState(opts.statePath, state);
+
+      const stamp = new Date().toISOString().slice(11, 19);
+      const universe = Object.keys(state.seen).length;
+      process.stderr.write(
+        `[${stamp}] cycle ${cycle}: ${result.scanned} scanned, ${result.shortlisted} shortlisted, ` +
+          `${alerts.length} new · universe ${universe} · ruled out ${Object.keys(state.blocked).length}\n`,
+      );
+
+      if (alerts.length > 0) {
+        // Bell first: the point of a watcher is that you are not looking at it.
+        process.stdout.write('');
+        console.log(renderTable(alerts.sort((a, b) => b.score - a.score)));
+        for (const verdict of alerts) {
+          logAlert(opts.alertLog, verdict, Date.now());
+          if (opts.notify) notify(verdict);
+        }
+      }
+    } catch (err) {
+      // A bad cycle is normal — rate limits, a flaky RPC. Keep watching.
+      process.stderr.write(`[cycle ${cycle}] ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+
+    const elapsed = Date.now() - startedAt;
+    const wait = Math.max(0, opts.watchSeconds * 1000 - elapsed);
+    if (running && wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  }
 }
 
 async function runToken(mint: string, opts: Options, rpc: SolanaRpc) {
@@ -305,6 +449,7 @@ async function main() {
 
   const rpc = new SolanaRpc(rpcUrl, throttleMs);
   if (opts.token) await runToken(opts.token, opts, rpc);
+  else if (opts.watchSeconds !== null) await runWatch(opts, rpc);
   else await runScan(opts, rpc);
 }
 

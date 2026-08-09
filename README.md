@@ -68,6 +68,12 @@ off their high:
 node src/index.ts --fresh
 ```
 
+Watch continuously and alert only on tokens that newly clear every gate:
+
+```bash
+node src/index.ts --watch --fresh --notify
+```
+
 Filter by narrative:
 
 ```bash
@@ -92,6 +98,52 @@ testing, a "RAVECAT" lookup by symbol returned a *different* mint with 69.6% of
 supply in one wallet and zero trades in an hour. Always act on the CA.
 
 Run `node src/index.ts --help` for every flag. Tests: `npm test`.
+
+## Watch mode
+
+A single scan sees whatever DexScreener's feeds hold at that moment — a few
+dozen tokens. Discovery is the real bottleneck, and no amount of filtering fixes
+it. Polling does.
+
+```bash
+node src/index.ts --watch 90 --fresh --notify
+```
+
+Observed over five cycles during development: the evaluated universe grew
+49 → 59 → 60 while each individual scan still returned ~45. Run it for an hour
+and it has seen far more than any one scan can.
+
+State lives in `out/watch-state.json` and survives restarts. Three behaviours
+make it usable rather than noisy:
+
+**Nothing alerts twice.** A token that cleared the gates is recorded. It will
+not fire again for six hours (`--cooldown`), so a token hovering on a threshold
+cannot spam the loop. After that window it can fire again — it dropped out and
+came back, which is worth knowing.
+
+**Permanent rejections are remembered; transient ones are not.** This split is
+the whole reason watch mode is affordable:
+
+| Rejected for | Re-checked? | Why |
+| --- | --- | --- |
+| Bundled launch, shared funder | Never | Describes history — no future candle changes it |
+| Too old | Never | A token only gets older |
+| Too young, thin liquidity, low cap, mid-drawdown, low volume | Every cycle | Exactly the tokens that become interesting twenty minutes later |
+| Live mint/freeze authority | Every cycle | A deployer can revoke these later |
+
+In the run above, 16 of 60 tokens were permanently ruled out, so their expensive
+on-chain checks never ran again.
+
+**A bad cycle is survivable.** Rate limits and flaky RPCs are normal; a failed
+cycle logs and the loop continues. Ctrl-C saves state and exits cleanly.
+
+Every alert appends a line to `out/alerts.jsonl` with the contract address,
+score, market cap, phase and warnings — so a session's calls can be reviewed
+afterwards instead of scrolling back through a terminal.
+
+`--notify` posts a macOS desktop notification per alert. Token names come from
+on-chain data and are untrusted, so they are stripped of anything that could
+break out of the notification script before being displayed.
 
 ## How it decides
 
@@ -363,6 +415,7 @@ src/bundle.ts       account dating and same-slot cluster detection
 src/funding.ts      funder tracing and common-source grouping
 src/presence.ts     profile, socials, boosts and DexScreener paid orders
 src/phase.ts        drawdown-from-peak reconstruction
+src/watch.ts        watch-mode state, de-duplication and alert log
 src/base58.ts       pubkey encoding for raw account data
 src/checks.ts       pure decision logic — gates and scoring
 src/render.ts       terminal output
