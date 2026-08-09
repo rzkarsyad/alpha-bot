@@ -28,6 +28,7 @@ function verdict(mint: string, failCodes: FailCode[] = [], score = 70): Verdict 
           paidOrders: ['tokenProfile'], paidAt: 1, ordersChecked: true,
         },
         liquidityUsd: 50_000, fdv: 500_000, marketCap: 500_000, priceUsd: 0.001, ageMinutes: 120,
+        tokenAgeMinutes: 240, priorMoveH6: 320, priorMoveH24: 320,
         volume: { m5: 0, h1: 50_000, h6: 0, h24: 200_000 },
         priceChange: { m5: 0, h1: 10, h6: 40, h24: 90 },
         txns: {
@@ -37,6 +38,9 @@ function verdict(mint: string, failCodes: FailCode[] = [], score = 70): Verdict 
       },
       safety: null, holders: null, lp: null, bundle: null, funding: null,
       price: { drawdownFromPeak: 0.05, phase: 'running' },
+      accumulation: {
+        volumeAcceleration: 2.4, tradeAcceleration: 2.1, buyPressureShift: 0.08, coiled: true,
+      },
       onchainError: null,
     },
     fails: failCodes.map((c) => `failed: ${c}`),
@@ -193,4 +197,10 @@ test('each alert appends one JSON line carrying the contract address', () => {
   assert.equal(first.phase, 'running');
   assert.equal(first.marketCapUsd, 500_000);
   assert.ok(first.at.startsWith('2023-'), `unexpected timestamp ${first.at}`);
+  // Without these an alert cannot be audited later: by the time anyone reads
+  // it, the token no longer looks the way it did when it fired.
+  assert.equal(first.tokenAgeMinutes, 240, 'token age, not just pair age');
+  assert.equal(first.priorMoveH6, 320, 'the move it had already made elsewhere');
+  assert.equal(first.volumeAcceleration, 2.4);
+  assert.equal(first.coiled, true);
 });

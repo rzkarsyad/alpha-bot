@@ -115,6 +115,15 @@ export function logAlert(path: string, verdict: Verdict, at: number): void {
     name: c.name,
     score: verdict.score,
     ageMinutes: c.ageMinutes === null ? null : Math.round(c.ageMinutes),
+    // Recorded so an alert can be audited afterwards against what the token
+    // looked like at the time, rather than against what it looks like once
+    // someone gets round to reading the notification.
+    tokenAgeMinutes: c.tokenAgeMinutes === null ? null : Math.round(c.tokenAgeMinutes),
+    priceChangeH1: c.priceChange.h1,
+    priorMoveH6: c.priorMoveH6,
+    priorMoveH24: c.priorMoveH24,
+    volumeAcceleration: verdict.enriched.accumulation.volumeAcceleration,
+    coiled: verdict.enriched.accumulation.coiled,
     marketCapUsd: c.marketCap,
     liquidityUsd: c.liquidityUsd,
     volumeH1Usd: c.volume.h1,
