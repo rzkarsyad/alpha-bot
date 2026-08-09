@@ -125,15 +125,36 @@ export async function fetchPairs(mints: string[]): Promise<Candidate[]> {
       const candidate = toCandidate(pair, now);
       if (!candidate) continue;
       const incumbent = best.get(candidate.mint);
-      if (!incumbent || rank(candidate) > rank(incumbent)) best.set(candidate.mint, candidate);
+      if (!incumbent || isBetterPair(candidate, incumbent)) best.set(candidate.mint, candidate);
     }
   }
   return [...best.values()];
 }
 
-/** Prefer real liquidity; fall back to 24h volume so bonding-curve pairs still rank. */
-function rank(c: Candidate): number {
-  return c.liquidityUsd ?? c.volume.h24;
+/**
+ * Choose which of a token's pairs to judge it on: the one you would actually
+ * route through.
+ *
+ * A graduated token keeps its dead pre-graduation pair listed alongside the
+ * live one, so this choice decides whether the whole report describes reality.
+ * Liquidity always wins over its absence — an earlier version fell back to 24h
+ * volume when liquidity was missing and then compared that volume against
+ * another pair's liquidity. Different units, so a dead bonding curve with
+ * $43k of stale 24h volume outranked the live pool holding $25k, and every
+ * downstream number described the wrong pair.
+ */
+export function isBetterPair(candidate: Candidate, incumbent: Candidate): boolean {
+  const hasLiquidity = candidate.liquidityUsd !== null;
+  const incumbentHasLiquidity = incumbent.liquidityUsd !== null;
+
+  // Any pair with real liquidity beats any pair without.
+  if (hasLiquidity !== incumbentHasLiquidity) return hasLiquidity;
+
+  // Both have it: deeper wins. Neither does: fall back to volume, which is now
+  // a like-for-like comparison.
+  return hasLiquidity
+    ? (candidate.liquidityUsd ?? 0) > (incumbent.liquidityUsd ?? 0)
+    : candidate.volume.h24 > incumbent.volume.h24;
 }
 
 /** Look up one specific token — used by `--token <mint>`. */
