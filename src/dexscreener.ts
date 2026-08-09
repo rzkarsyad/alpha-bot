@@ -2,6 +2,7 @@
 // Discovery is deliberately shallow: it surfaces tokens that exist, the gates in
 // checks.ts decide whether any of them are worth looking at.
 
+import { readPresence } from './presence.ts';
 import type { Candidate, PairStats, TxnStats } from './types.ts';
 
 const BASE = 'https://api.dexscreener.com';
@@ -25,6 +26,13 @@ type RawPair = {
   volume?: Partial<PairStats>;
   priceChange?: Partial<PairStats>;
   txns?: Partial<TxnStats>;
+  info?: {
+    imageUrl?: string;
+    header?: string;
+    websites?: unknown[];
+    socials?: Array<{ type?: string; url?: string }>;
+  };
+  boosts?: { active?: number };
 };
 
 async function getJson<T>(path: string): Promise<T> {
@@ -61,6 +69,8 @@ function toCandidate(pair: RawPair, now: number): Candidate | null {
     pairAddress: pair.pairAddress ?? '',
     url: pair.url ?? `https://dexscreener.com/solana/${mint}`,
     quoteSymbol: pair.quoteToken?.symbol ?? '?',
+    // Profile, socials and boosts ride along on this response at no extra cost.
+    presence: readPresence(pair.info, pair.boosts?.active),
     // Absent liquidity is "unknown", not zero — pre-graduation pump.fun pairs
     // trade on a bonding curve and report no liquidity object at all.
     liquidityUsd: typeof pair.liquidity?.usd === 'number' ? pair.liquidity.usd : null,

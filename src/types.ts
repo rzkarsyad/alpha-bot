@@ -15,6 +15,38 @@ export type TxnStats = {
   h24: { buys: number; sells: number };
 };
 
+/**
+ * Signals that someone invested effort or money in the token's presentation.
+ * None of this proves legitimacy — a rug can buy a profile — but the absence of
+ * all of it marks a token nobody bothered to dress up before launching.
+ */
+export type TokenPresence = {
+  /** A DexScreener profile with artwork, i.e. the listing was actually set up. */
+  hasProfile: boolean;
+  /** Social platforms linked from the listing, e.g. ['twitter', 'telegram']. */
+  socials: string[];
+  websites: number;
+  /** Active paid DexScreener boosts. */
+  boostsActive: number;
+  /** Paid order types, e.g. ['tokenProfile']. Empty means nothing was paid for. */
+  paidOrders: string[];
+  /** When the first order was paid for, ms. Null when unpaid or unchecked. */
+  paidAt: number | null;
+  /** True once the paid-order lookup has actually run. */
+  ordersChecked: boolean;
+};
+
+/** Where the token sits in its move — the "am I early or exit liquidity" question. */
+export type PriceContext = {
+  /**
+   * Drop from the highest price implied by the 5m/1h/6h/24h change points.
+   * A lower bound on the true drawdown: only four points are sampled, so a peak
+   * between them is invisible.
+   */
+  drawdownFromPeak: number;
+  phase: 'building' | 'running' | 'parabolic' | 'faded';
+};
+
 /** A Solana pair as returned by DexScreener, normalised to what we actually use. */
 export type Candidate = {
   mint: string;
@@ -24,6 +56,7 @@ export type Candidate = {
   pairAddress: string;
   url: string;
   quoteSymbol: string;
+  presence: TokenPresence;
   /** null when DexScreener reports no liquidity object (typical pre-graduation pump.fun). */
   liquidityUsd: number | null;
   fdv: number | null;
@@ -134,6 +167,7 @@ export type Enriched = {
   lp: LpStatus | null;
   bundle: BundleAnalysis | null;
   funding: FundingAnalysis | null;
+  price: PriceContext;
   /** Populated when an on-chain lookup failed; the token is reported, not silently dropped. */
   onchainError: string | null;
 };

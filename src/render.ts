@@ -1,7 +1,8 @@
 // Terminal output. Kept separate from checks.ts so the rules stay testable.
 
 import { pct, usd, volumeToLiquidity, buyPressure } from './checks.ts';
-import type { LpStatus, Verdict } from './types.ts';
+import { presenceBadge } from './presence.ts';
+import type { LpStatus, PriceContext, TokenPresence, Verdict } from './types.ts';
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code: string) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -30,6 +31,20 @@ function lpBadge(lp: LpStatus | null): string {
   return yellow('open');
 }
 
+function presenceColor(p: TokenPresence): string {
+  const badge = presenceBadge(p);
+  if (badge === 'bare') return red(badge);
+  if (p.paidOrders.length > 0) return green(badge);
+  return yellow(badge);
+}
+
+function phaseBadge(phase: PriceContext['phase']): string {
+  if (phase === 'building') return green('building');
+  if (phase === 'running') return green('running');
+  if (phase === 'parabolic') return yellow('parabolic');
+  return red('faded');
+}
+
 function scoreColor(score: number): string {
   const text = String(score).padStart(3);
   if (score >= 65) return green(text);
@@ -47,11 +62,11 @@ export function renderTable(verdicts: Verdict[]): string {
   lines.push('');
   lines.push(
     bold(
-      pad('SCORE', 7) + pad('TICKER', 12) + pad('AGE', 7) + pad('LIQ', 9) +
-      pad('FDV', 9) + pad('VOL 1H', 9) + pad('BUY%', 7) + pad('TOP10', 7) + pad('LP', 10) + 'DEX',
+      pad('SCORE', 7) + pad('TICKER', 12) + pad('AGE', 7) + pad('MC', 9) + pad('LIQ', 9) +
+      pad('VOL 1H', 9) + pad('BUY%', 7) + pad('TOP10', 7) + pad('LP', 9) + pad('PRESENCE', 14) + 'PHASE',
     ),
   );
-  lines.push(dim('─'.repeat(96)));
+  lines.push(dim('─'.repeat(107)));
 
   for (const v of verdicts) {
     const c = v.enriched.candidate;
@@ -62,18 +77,22 @@ export function renderTable(verdicts: Verdict[]): string {
       pad(scoreColor(v.score), 7) +
         pad(cyan(c.symbol.slice(0, 10)), 12) +
         pad(c.ageMinutes === null ? '?' : formatAge(c.ageMinutes), 7) +
+        pad(c.marketCap === null ? dim('n/a') : usd(c.marketCap), 9) +
         pad(c.liquidityUsd === null ? dim('n/a') : usd(c.liquidityUsd), 9) +
-        pad(c.fdv === null ? dim('n/a') : usd(c.fdv), 9) +
         pad(usd(c.volume.h1), 9) +
         pad(pressure === null ? dim('n/a') : pct(pressure), 7) +
         pad(holders === null ? dim('?') : pct(holders.top10Share), 7) +
-        pad(lpBadge(v.enriched.lp), 10) +
-        dim(c.dexId),
+        pad(lpBadge(v.enriched.lp), 9) +
+        pad(presenceColor(c.presence), 14) +
+        phaseBadge(v.enriched.price.phase),
     );
 
     if (v.reasons.length > 0) lines.push(dim(`       ${v.reasons.join(' · ')}`));
     for (const w of v.warnings) lines.push(yellow(`       ! ${w}`));
-    lines.push(dim(`       ${c.url}`));
+    // The contract address is the only thing you actually need to act, so it
+    // gets its own line rather than being buried in a URL slug.
+    lines.push(`       ${bold('CA')} ${c.mint}`);
+    lines.push(dim(`       ${c.dexId} · ${c.url}`));
     lines.push('');
   }
   return lines.join('\n');
@@ -98,8 +117,25 @@ export function renderDetail(v: Verdict): string {
   const bad = (label: string) => `${red('✗')} ${label}`;
 
   lines.push('');
-  lines.push(bold(`${c.name} (${c.symbol})`) + dim(`  ${c.mint}`));
+  lines.push(bold(`${c.name} (${c.symbol})`));
+  lines.push(`${bold('CA')} ${c.mint}`);
   lines.push(dim(c.url));
+  lines.push('');
+
+  lines.push(bold('Presence'));
+  const p = c.presence;
+  lines.push(p.hasProfile ? ok('DexScreener profile set up') : bad('no DexScreener profile'));
+  lines.push(
+    p.socials.length > 0
+      ? ok(`socials: ${p.socials.join(', ')}${p.websites > 0 ? ` (+${p.websites} website)` : ''}`)
+      : bad('no socials linked'),
+  );
+  if (!p.ordersChecked) lines.push(yellow('? paid status not checked'));
+  else if (p.paidOrders.length > 0) {
+    const when = p.paidAt ? new Date(p.paidAt).toISOString().slice(0, 10) : 'unknown date';
+    lines.push(ok(`paid DexScreener: ${p.paidOrders.join(', ')} (${when})`));
+  } else lines.push(bad('nothing paid to DexScreener'));
+  lines.push(p.boostsActive > 0 ? ok(`${p.boostsActive} active boost(s)`) : dim('  no active boosts'));
   lines.push('');
 
   lines.push(bold('Authority'));
@@ -199,8 +235,13 @@ export function renderDetail(v: Verdict): string {
   lines.push(`  volume 1h/24h  ${usd(c.volume.h1)} / ${usd(c.volume.h24)}`);
   const vl = volumeToLiquidity(c.volume.h24, c.liquidityUsd);
   lines.push(`  vol/liq        ${vl === null ? 'n/a' : `${vl.toFixed(1)}x`}`);
+  lines.push(`  market cap     ${c.marketCap === null ? 'n/a' : usd(c.marketCap)}`);
   lines.push(`  trades 1h      ${c.txns.h1.buys} buy / ${c.txns.h1.sells} sell`);
   lines.push(`  change 1h/6h   ${c.priceChange.h1.toFixed(1)}% / ${c.priceChange.h6.toFixed(1)}%`);
+  lines.push(
+    `  off recent high ${pct(v.enriched.price.drawdownFromPeak)}  ` +
+      `phase ${phaseBadge(v.enriched.price.phase)}`,
+  );
 
   lines.push('');
   if (v.fails.length > 0) {

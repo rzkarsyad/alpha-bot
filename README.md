@@ -61,11 +61,35 @@ Full due-diligence report on one token before you buy:
 node src/index.ts --token <mint-address>
 ```
 
+Hunt newly-launched tokens — under 12h old, sub-$1M cap, and not already 30%
+off their high:
+
+```bash
+node src/index.ts --fresh
+```
+
+Filter by narrative:
+
+```bash
+node src/index.ts --meta ai,agent,cat --meta-only
+```
+
+Only tokens that paid DexScreener for placement:
+
+```bash
+node src/index.ts --require-paid
+```
+
 Loosen the gates (understand what you are giving up first):
 
 ```bash
 node src/index.ts --min-liq 10000 --max-fdv 20000000 --min-age 15
 ```
+
+Every passing token prints its contract address on its own line, so the mint is
+the thing you copy — not a ticker. Tickers are freely reusable on Solana: during
+testing, a "RAVECAT" lookup by symbol returned a *different* mint with 69.6% of
+supply in one wallet and zero trades in an hour. Always act on the CA.
 
 Run `node src/index.ts --help` for every flag. Tests: `npm test`.
 
@@ -93,6 +117,9 @@ Fail any one of these and the token is excluded outright, regardless of score.
 | No single wallet > 10% of LP | That wallet can withdraw that share of the pool at will |
 | Liquidity ≥ $25k | Below this you cannot exit without catastrophic slippage |
 | FDV ≤ $5M | Above this the early thesis is already priced in |
+| Market cap $50k – $5M | Below, nothing to sell into; above, the move already happened |
+| Not bare | No profile, no socials, no boosts, nothing paid — nobody invested anything |
+| ≤ 50% off its recent high | Past that, the move played out without you |
 | 1h volume ≥ $20k and ≥ 100 trades | Below this you are the only exit liquidity |
 | 24h volume < 40× liquidity | Higher is the signature of wash trading, not demand |
 | Age 30min – 72h | Younger has no signal; older is not an early play |
@@ -139,6 +166,58 @@ cluster it joined. Those are counted as undated and disclosed rather than
 guessed at. The launch window is anchored on the earliest dated holder rather
 than the pair's creation time, so a migrated token is measured against its own
 genesis instead of its pool's.
+
+### Presence: profile, socials, and what was paid for
+
+Read these for what they are. Paying DexScreener for a token profile does not
+make a token honest — a well-funded rug buys one without blinking. What it does
+is cost money and leave a receipt, which the cheapest throwaway launches skip.
+So presence works as a **floor**, not as evidence.
+
+| Signal | Source | Cost |
+| --- | --- | --- |
+| Profile artwork | `info.imageUrl` / `info.header` on the pair | free, already fetched |
+| Socials and websites | `info.socials`, `info.websites` | free, already fetched |
+| Active boosts | `info.boosts.active` | free, already fetched |
+| Paid orders | `/orders/v1/solana/{mint}` | one request, shortlist only |
+
+Only **approved** orders count — a `processing` payment can still be rejected.
+A failed lookup leaves `ordersChecked` false, so "not paid" and "not checked"
+never collapse into the same answer.
+
+The hard gate is deliberately weak: a token is rejected only when it has
+*nothing* — no profile, no socials, no boosts, nothing paid. `--require-paid`
+tightens it to receipts only.
+
+### Where the token is in its move
+
+"Early call before ATH" needs an answer to: has this already run? DexScreener
+publishes no all-time high, but it publishes the percentage change over 5m, 1h,
+6h and 24h — and each implies what the price *was* at that point:
+
+```
+change of +X% over a period  =>  price_then = price_now / (1 + X/100)
+```
+
+The highest of those four points is a floor on the recent peak, so the gap down
+to the current price is a floor on the drawdown. This is a lower bound by
+construction: a spike between two samples is invisible. It cannot overstate how
+far the token has fallen, which is the safe direction for a filter trying to
+avoid buying tops.
+
+| Phase | Meaning |
+| --- | --- |
+| `building` | Quiet, no big move yet |
+| `running` | Up over 6h and still holding |
+| `parabolic` | 1h over +300% — the entry already happened |
+| `faded` | More than 40% off the recent high — it played out |
+
+### Meta
+
+`--meta ai,agent,cat` ranks matching tokens higher; `--meta-only` rejects
+everything else. Matching is anchored at word starts, because plain substring
+matching is unusable here — the term `ai` hits "pl**ai**n", "ch**ai**n" and
+"s**ai**d", which would pass almost everything.
 
 ### Common funding
 
@@ -224,14 +303,19 @@ probability of anything.
 
 | Component | Max | Rewards |
 | --- | --- | --- |
-| Liquidity depth | 15 | Log-scaled — $200k is not 10× better than $20k in practice |
-| Turnover | 20 | Volume/liquidity near 8×; penalised when too dead or too washed |
-| Buy pressure | 20 | 1h and 6h blended, so one green candle cannot carry it |
-| Participation | 15 | Trade count as a proxy for distinct participants |
-| Distribution | 15 | Flatter top-10 scores higher |
-| Trend quality | 15 | Rising 6h base; **halved** when 1h is already +300% |
+| Turnover | 16 | Volume/liquidity near 8×; penalised when too dead or too washed |
+| Buy pressure | 16 | 1h and 6h blended, so one green candle cannot carry it |
+| Distribution | 14 | Flatter top-10 scores higher |
+| Liquidity depth | 12 | Log-scaled — $200k is not 10× better than $20k in practice |
+| Participation | 12 | Trade count as a proxy for distinct participants |
+| Trend quality | 10 | Rising 6h base; **halved** when 1h is already +300% |
+| Headroom | 10 | Near the recent high, i.e. the move has not happened yet |
+| Presentation | 10 | Profile, socials, and whether anything was paid for |
 
-That last penalty is deliberate. A vertical hourly candle is the part of the move
+The weights sum to exactly 100, and a test asserts it — otherwise "out of 100"
+is a lie in one direction or the other.
+
+The trend penalty is deliberate. A vertical hourly candle is the part of the move
 that happened without you.
 
 ## Tuning
@@ -277,6 +361,8 @@ src/solana.ts       RPC, mint decoding, holder classification
 src/lp.ts           AMM pool layouts, LP burn/lock classification
 src/bundle.ts       account dating and same-slot cluster detection
 src/funding.ts      funder tracing and common-source grouping
+src/presence.ts     profile, socials, boosts and DexScreener paid orders
+src/phase.ts        drawdown-from-peak reconstruction
 src/base58.ts       pubkey encoding for raw account data
 src/checks.ts       pure decision logic — gates and scoring
 src/render.ts       terminal output

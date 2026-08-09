@@ -15,6 +15,8 @@ import { SolanaRpc, fetchMintSafety, resolveHoldings, summariseConcentration } f
 import { fetchLpStatuses } from './lp.ts';
 import { analyzeBundle } from './bundle.ts';
 import { analyzeFunders } from './funding.ts';
+import { applyOrders, fetchOrders } from './presence.ts';
+import { derivePriceContext } from './phase.ts';
 import { renderDetail, renderRejected, renderTable } from './render.ts';
 import type { Candidate, Enriched, LpStatus, MintSafety, Verdict } from './types.ts';
 
@@ -55,6 +57,24 @@ function parseArgs(argv: string[]): Options {
       case '--skip-funders': t.skipFunderTracing = true; break;
       case '--require-lp': t.requireVerifiableLp = true; break;
       case '--allow-unknown-liq': t.allowUnknownLiquidity = true; break;
+      case '--min-mc': t.minMarketCapUsd = Number(next()); break;
+      case '--max-mc': t.maxMarketCapUsd = Number(next()); break;
+      case '--require-paid': t.requireDexPaid = true; break;
+      case '--min-socials': t.minSocials = Number(next()); break;
+      case '--allow-bare': t.requirePresence = false; break;
+      case '--max-drawdown': t.maxDrawdownFromPeak = Number(next()) / 100; break;
+      case '--meta': t.metaTerms = (next() ?? '').split(',').map((s) => s.trim()).filter(Boolean); break;
+      case '--meta-only': t.metaOnly = true; break;
+      case '--fresh':
+        // Preset for catching launches early: younger, smaller, and stricter
+        // about the move not having happened yet.
+        t.minAgeMinutes = 30;
+        t.maxAgeHours = 12;
+        t.maxMarketCapUsd = 1_000_000;
+        t.maxFdvUsd = 1_000_000;
+        t.minLiquidityUsd = 20_000;
+        t.maxDrawdownFromPeak = 0.3;
+        break;
       case '--help': case '-h': printHelp(); process.exit(0);
       default:
         if (arg.startsWith('--')) {
@@ -95,6 +115,22 @@ Threshold overrides
   --require-lp          Reject pools whose LP model cannot be verified
   --allow-unknown-liq   Include pre-graduation pump.fun pairs
 
+Market cap, presentation and timing
+  --min-mc <usd>        Minimum market cap       (default ${DEFAULT_THRESHOLDS.minMarketCapUsd})
+  --max-mc <usd>        Maximum market cap       (default ${DEFAULT_THRESHOLDS.maxMarketCapUsd})
+  --require-paid        Only tokens that paid DexScreener for placement
+  --min-socials <n>     Minimum linked socials   (default ${DEFAULT_THRESHOLDS.minSocials})
+  --allow-bare          Keep tokens with no profile, socials or boosts
+  --max-drawdown <pct>  Max fall from recent high (default ${DEFAULT_THRESHOLDS.maxDrawdownFromPeak * 100})
+
+Meta
+  --meta <a,b,c>        Rank matches higher, e.g. --meta ai,agent,cat
+  --meta-only           Reject anything that does not match a meta term
+
+Presets
+  --fresh               Newly-launched hunt: max 12h old, sub-$1M cap,
+                        max 30% off its high
+
 This tool filters out known rug mechanics. It does not predict price.
 `);
 }
@@ -106,6 +142,15 @@ async function enrich(
   thresholds: Thresholds,
 ): Promise<Enriched[]> {
   const mints = candidates.map((c) => c.mint);
+
+  // Paid-order lookups are one request each, so they wait until the shortlist.
+  // A failure leaves ordersChecked false, keeping "not paid" distinct from
+  // "not checked".
+  const orderResults = await Promise.all(candidates.map((c) => fetchOrders(c.mint)));
+  candidates.forEach((candidate, i) => {
+    const orders = orderResults[i];
+    if (orders) candidate.presence = applyOrders(candidate.presence, orders);
+  });
 
   let safetyByMint = new Map<string, MintSafety>();
   let batchError: string | null = null;
@@ -135,6 +180,7 @@ async function enrich(
         lp,
         bundle: null,
         funding: null,
+        price: derivePriceContext(candidate.priceChange),
         onchainError: batchError ?? 'mint account not found',
       });
       continue;
@@ -169,7 +215,11 @@ async function enrich(
     } catch (err) {
       onchainError = err instanceof Error ? err.message : String(err);
     }
-    out.push({ candidate, safety, holders, lp, bundle, funding, onchainError: holders ? null : onchainError });
+    out.push({
+      candidate, safety, holders, lp, bundle, funding,
+      price: derivePriceContext(candidate.priceChange),
+      onchainError: holders ? null : onchainError,
+    });
   }
   return out;
 }
@@ -191,7 +241,8 @@ async function runScan(opts: Options, rpc: SolanaRpc) {
     .map(
       (candidate) =>
         ({
-          candidate, safety: null, holders: null, lp: null, bundle: null, funding: null, onchainError: null,
+          candidate, safety: null, holders: null, lp: null, bundle: null, funding: null,
+          price: derivePriceContext(candidate.priceChange), onchainError: null,
         }) satisfies Enriched,
     )
     .map((enriched) => evaluate(enriched, opts.thresholds));

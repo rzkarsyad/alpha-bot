@@ -9,6 +9,7 @@
 // past a live mint authority.
 
 import type { Thresholds } from './config.ts';
+import { isBare } from './presence.ts';
 import type { Enriched, Verdict } from './types.ts';
 
 export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
@@ -181,6 +182,13 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   if (c.fdv !== null && c.fdv > t.maxFdvUsd) {
     fails.push(`FDV ${usd(c.fdv)} above ${usd(t.maxFdvUsd)} — not early any more`);
   }
+  if (c.marketCap !== null) {
+    if (c.marketCap < t.minMarketCapUsd) {
+      fails.push(`market cap ${usd(c.marketCap)} below ${usd(t.minMarketCapUsd)} — nothing to sell into`);
+    } else if (c.marketCap > t.maxMarketCapUsd) {
+      fails.push(`market cap ${usd(c.marketCap)} above ${usd(t.maxMarketCapUsd)} — the move already happened`);
+    }
+  }
   if (c.volume.h1 < t.minVolumeH1Usd) {
     fails.push(`1h volume ${usd(c.volume.h1)} below ${usd(t.minVolumeH1Usd)} — no real flow`);
   }
@@ -195,8 +203,59 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     fails.push(`24h volume is ${volLiq.toFixed(0)}x liquidity — consistent with wash trading`);
   }
 
+  // --- Stage 5: presentation and timing -------------------------------------
+  // These are cheap market-side signals, so they run in the first pass and stop
+  // obviously-throwaway tokens before any RPC budget is spent on them.
+  const p = c.presence;
+  if (t.requirePresence && isBare(p)) {
+    fails.push('no profile, no socials, no boosts, nothing paid — nobody invested anything in this');
+  }
+  if (p.socials.length < t.minSocials) {
+    const message = `${p.socials.length} social account(s) linked (want ${t.minSocials})`;
+    if (t.minSocials > 0 && p.socials.length === 0) fails.push(`${message} — no way to follow the project`);
+    else warnings.push(message);
+  }
+  if (t.requireDexPaid) {
+    if (!p.ordersChecked) warnings.push('DexScreener paid status not checked');
+    else if (p.paidOrders.length === 0) fails.push('nothing paid to DexScreener — no skin in the game');
+  }
+
+  const price = enriched.price;
+  if (price.drawdownFromPeak > t.maxDrawdownFromPeak) {
+    fails.push(
+      `already ${pct(price.drawdownFromPeak)} below its recent high — the move played out without you`,
+    );
+  }
+  if (price.phase === 'parabolic') {
+    warnings.push('price is vertical right now — buying here is buying someone else\'s exit');
+  }
+
+  if (t.metaTerms.length > 0) {
+    const matched = matchMeta(c.name, c.symbol, t.metaTerms);
+    if (matched.length === 0 && t.metaOnly) {
+      fails.push(`no match for meta terms (${t.metaTerms.join(', ')})`);
+    }
+  }
+
   const { score, reasons } = scoreMomentum(enriched);
   return { enriched, fails, warnings, score, reasons };
+}
+
+/**
+ * Match meta terms against a token's identity, anchored at word starts.
+ *
+ * Plain substring matching is unusable here: the term "ai" hits "plain",
+ * "chain" and "said", so a narrative filter would pass almost everything.
+ * Anchoring at a word boundary keeps "AI Agent" and "AIcoin" while dropping
+ * the accidental hits.
+ */
+export function matchMeta(name: string, symbol: string, terms: string[]): string[] {
+  const haystack = `${name} ${symbol}`;
+  return terms.filter((term) => {
+    if (term.length === 0) return false;
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}`, 'i').test(haystack);
+  });
 }
 
 export function volumeToLiquidity(volume24h: number, liquidityUsd: number | null): number | null {
@@ -216,58 +275,89 @@ export function buyPressure(slot: { buys: number; sells: number }): number | nul
  * anything and deliberately penalises charts that have already gone parabolic,
  * because that is the part of the move you missed rather than the part you catch.
  */
+/** Score components, summing to 100. Change these to re-weight what "good" means. */
+export const WEIGHTS = {
+  depth: 12,
+  turnover: 16,
+  pressure: 16,
+  participation: 12,
+  distribution: 14,
+  trend: 10,
+  headroom: 10,
+  presence: 10,
+} as const;
+
 export function scoreMomentum(enriched: Enriched): { score: number; reasons: string[] } {
   const { candidate: c, holders } = enriched;
   const reasons: string[] = [];
   let score = 0;
 
-  // Exit depth, 0..15. Log-scaled: $200k is not 10x better than $20k in practice.
+  // Exit depth, 0..12. Log-scaled: $200k is not 10x better than $20k in practice.
   if (c.liquidityUsd !== null && c.liquidityUsd > 0) {
-    const depth = clamp((Math.log10(c.liquidityUsd) - 4) / 1.5, 0, 1) * 15;
+    const depth = clamp((Math.log10(c.liquidityUsd) - 4) / 1.5, 0, 1) * WEIGHTS.depth;
     score += depth;
-    if (depth > 10) reasons.push(`deep liquidity ${usd(c.liquidityUsd)}`);
+    if (depth > WEIGHTS.depth * 0.7) reasons.push(`deep liquidity ${usd(c.liquidityUsd)}`);
   }
 
-  // Turnover, 0..20. Peaks around 8x daily volume/liquidity, decays either side.
+  // Turnover, 0..16. Peaks around 8x daily volume/liquidity, decays either side.
   const volLiq = volumeToLiquidity(c.volume.h24, c.liquidityUsd);
   if (volLiq !== null) {
-    const turnover = clamp(1 - Math.abs(Math.log10(Math.max(volLiq, 0.01)) - Math.log10(8)) / 1.2, 0, 1) * 20;
+    const turnover = clamp(1 - Math.abs(Math.log10(Math.max(volLiq, 0.01)) - Math.log10(8)) / 1.2, 0, 1) * WEIGHTS.turnover;
     score += turnover;
-    if (turnover > 13) reasons.push(`healthy turnover ${volLiq.toFixed(1)}x`);
+    if (turnover > WEIGHTS.turnover * 0.7) reasons.push(`healthy turnover ${volLiq.toFixed(1)}x`);
   }
 
-  // Buy pressure, 0..20. Blends the last hour with the last six so a single
+  // Buy pressure, 0..16. Blends the last hour with the last six so a single
   // green candle does not carry the score.
   const p1 = buyPressure(c.txns.h1);
   const p6 = buyPressure(c.txns.h6);
   if (p1 !== null || p6 !== null) {
     const blended = p1 !== null && p6 !== null ? p1 * 0.6 + p6 * 0.4 : (p1 ?? p6) ?? 0.5;
-    const pressure = clamp((blended - 0.45) / 0.2, 0, 1) * 20;
+    const pressure = clamp((blended - 0.45) / 0.2, 0, 1) * WEIGHTS.pressure;
     score += pressure;
-    if (pressure > 12) reasons.push(`buy pressure ${pct(blended)}`);
+    if (pressure > WEIGHTS.pressure * 0.7) reasons.push(`buy pressure ${pct(blended)}`);
   }
 
-  // Participation, 0..15. More distinct trades means more distinct participants.
+  // Participation, 0..12. More distinct trades means more distinct participants.
   const txnsH1 = c.txns.h1.buys + c.txns.h1.sells;
-  const participation = clamp(Math.log10(Math.max(txnsH1, 1)) / 3.2, 0, 1) * 15;
+  const participation = clamp(Math.log10(Math.max(txnsH1, 1)) / 3.2, 0, 1) * WEIGHTS.participation;
   score += participation;
-  if (participation > 10) reasons.push(`${txnsH1} trades in 1h`);
+  if (participation > WEIGHTS.participation * 0.7) reasons.push(`${txnsH1} trades in 1h`);
 
-  // Distribution, 0..15. Flat top-10 is the single best proxy for "no one wallet
+  // Distribution, 0..14. Flat top-10 is the single best proxy for "no one wallet
   // can end this".
   if (holders) {
-    const spread = clamp(1 - holders.top10Share / 0.3, 0, 1) * 15;
+    const spread = clamp(1 - holders.top10Share / 0.3, 0, 1) * WEIGHTS.distribution;
     score += spread;
-    if (spread > 10) reasons.push(`top10 only ${pct(holders.top10Share)}`);
+    if (spread > WEIGHTS.distribution * 0.7) reasons.push(`top10 only ${pct(holders.top10Share)}`);
   }
 
-  // Trend quality, 0..15. Rewards a rising 6h base; punishes a vertical 1h that
+  // Trend quality, 0..10. Rewards a rising 6h base; punishes a vertical 1h that
   // means the entry already happened without you.
-  const trend = clamp((c.priceChange.h6 + c.priceChange.h1) / 200, 0, 1) * 15;
+  const trend = clamp((c.priceChange.h6 + c.priceChange.h1) / 200, 0, 1) * WEIGHTS.trend;
   const overheated = c.priceChange.h1 > 300 ? 0.5 : 1;
   score += trend * overheated;
-  if (trend * overheated > 8) reasons.push(`trending +${c.priceChange.h6.toFixed(0)}% 6h`);
+  if (trend * overheated > WEIGHTS.trend * 0.7) reasons.push(`trending +${c.priceChange.h6.toFixed(0)}% 6h`);
   if (overheated < 1) reasons.push(`already +${c.priceChange.h1.toFixed(0)}% in 1h — late entry`);
+
+  // Headroom, 0..10. Sitting near the recent high is what "before the top"
+  // looks like; a token well off its peak has already had its move.
+  const headroom = clamp(1 - enriched.price.drawdownFromPeak / 0.4, 0, 1) * WEIGHTS.headroom;
+  score += headroom;
+  if (enriched.price.drawdownFromPeak > 0.15) {
+    reasons.push(`${pct(enriched.price.drawdownFromPeak)} off recent high`);
+  }
+
+  // Presentation, 0..10. Cheap to fake, but free to read, and its total absence
+  // is the single most common feature of a throwaway launch.
+  const p = c.presence;
+  let presence = 0;
+  if (p.hasProfile) presence += 3;
+  if (p.paidOrders.length > 0) presence += 4;
+  presence += Math.min(p.socials.length, 2) * 1.5;
+  score += Math.min(presence, WEIGHTS.presence);
+  if (p.paidOrders.length > 0) reasons.push(`dex paid (${p.paidOrders.join(', ')})`);
+  else if (p.hasProfile) reasons.push('has profile');
 
   return { score: Math.round(clamp(score, 0, 100)), reasons };
 }

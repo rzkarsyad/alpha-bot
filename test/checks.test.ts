@@ -1,14 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { evaluate, scoreMomentum, volumeToLiquidity, buyPressure } from '../src/checks.ts';
+import { evaluate, matchMeta, scoreMomentum, volumeToLiquidity, buyPressure, WEIGHTS } from '../src/checks.ts';
 import { decodeMint } from '../src/solana.ts';
 import { DEFAULT_THRESHOLDS } from '../src/config.ts';
 import type {
   BundleAnalysis, Candidate, Enriched, FundingAnalysis, HolderConcentration, LpStatus, MintSafety,
+  TokenPresence,
 } from '../src/types.ts';
+import { derivePriceContext } from '../src/phase.ts';
 
 // --- fixtures ---------------------------------------------------------------
+
+function presence(overrides: Partial<TokenPresence> = {}): TokenPresence {
+  return {
+    hasProfile: true,
+    socials: ['twitter'],
+    websites: 1,
+    boostsActive: 0,
+    paidOrders: ['tokenProfile'],
+    paidAt: 1_700_000_000_000,
+    ordersChecked: true,
+    ...overrides,
+  };
+}
 
 function candidate(overrides: Partial<Candidate> = {}): Candidate {
   return {
@@ -19,6 +34,7 @@ function candidate(overrides: Partial<Candidate> = {}): Candidate {
     pairAddress: 'pair',
     url: 'https://dexscreener.com/solana/test',
     quoteSymbol: 'SOL',
+    presence: presence(),
     liquidityUsd: 80_000,
     fdv: 900_000,
     marketCap: 900_000,
@@ -113,6 +129,7 @@ function enriched(overrides: Partial<Enriched> = {}): Enriched {
     lp: lp(),
     bundle: bundle(),
     funding: funding(),
+    price: derivePriceContext((overrides.candidate ?? candidate()).priceChange),
     onchainError: null,
     ...overrides,
   };
@@ -385,6 +402,77 @@ test('too few trades in an hour is a hard fail even when volume looks fine', () 
   assert.match(failText(e), /only 9 trades in the last hour/);
 });
 
+// --- market cap, presentation and timing ------------------------------------
+
+test('market cap outside the window is a hard fail at either end', () => {
+  assert.match(failText(enriched({ candidate: candidate({ marketCap: 8_000 }) })), /nothing to sell into/);
+  assert.match(failText(enriched({ candidate: candidate({ marketCap: 40_000_000 }) })), /the move already happened/);
+});
+
+test('a token with no profile, socials, boosts or payment is rejected', () => {
+  const bare = presence({
+    hasProfile: false, socials: [], websites: 0, boostsActive: 0, paidOrders: [], paidAt: null,
+  });
+  assert.match(failText(enriched({ candidate: candidate({ presence: bare }) })), /nobody invested anything/);
+});
+
+test('a bare token is kept when the presence requirement is turned off', () => {
+  const bare = presence({
+    hasProfile: false, socials: [], websites: 0, boostsActive: 0, paidOrders: [], paidAt: null,
+  });
+  const verdict = evaluate(enriched({ candidate: candidate({ presence: bare }) }), {
+    ...T, requirePresence: false, minSocials: 0,
+  });
+  assert.deepEqual(verdict.fails, []);
+});
+
+test('requiring dex-paid distinguishes unpaid from unchecked', () => {
+  const strict = { ...T, requireDexPaid: true };
+
+  const unpaid = enriched({ candidate: candidate({ presence: presence({ paidOrders: [], paidAt: null }) }) });
+  assert.match(evaluate(unpaid, strict).fails.join(' '), /nothing paid to DexScreener/);
+
+  // A failed lookup must warn, never reject — that would punish a network blip.
+  const unchecked = enriched({
+    candidate: candidate({ presence: presence({ paidOrders: [], paidAt: null, ordersChecked: false }) }),
+  });
+  const verdict = evaluate(unchecked, strict);
+  assert.deepEqual(verdict.fails, []);
+  assert.match(verdict.warnings.join(' '), /paid status not checked/);
+});
+
+test('a token already well below its recent high is rejected', () => {
+  // -50% over 6h means it peaked six hours ago and has halved since.
+  const faded = candidate({ priceChange: { m5: -1, h1: -10, h6: -60, h24: 300 } });
+  assert.match(failText(enriched({ candidate: faded })), /below its recent high/);
+});
+
+test('a vertical price warns that you would be buying an exit', () => {
+  const hot = candidate({ priceChange: { m5: 40, h1: 900, h6: 1200, h24: 1200 } });
+  const verdict = evaluate(enriched({ candidate: hot }), T);
+  assert.deepEqual(verdict.fails, []);
+  assert.match(verdict.warnings.join(' '), /vertical right now/);
+});
+
+test('meta terms rank by default and reject only when asked', () => {
+  const cat = candidate({ name: 'Space Cat Agent', symbol: 'SCAT' });
+  const dog = candidate({ name: 'Plain Dog', symbol: 'PDOG' });
+  const terms = { ...T, metaTerms: ['agent', 'ai'] };
+
+  assert.deepEqual(evaluate(enriched({ candidate: cat }), terms).fails, []);
+  assert.deepEqual(evaluate(enriched({ candidate: dog }), terms).fails, [], 'ranking mode must not reject');
+
+  const only = { ...terms, metaOnly: true };
+  assert.deepEqual(evaluate(enriched({ candidate: cat }), only).fails, []);
+  assert.match(evaluate(enriched({ candidate: dog }), only).fails.join(' '), /no match for meta terms/);
+});
+
+test('matchMeta is case-insensitive across name and symbol', () => {
+  assert.deepEqual(matchMeta('Giga Chad AI', 'GCAI', ['ai', 'dog']), ['ai']);
+  assert.deepEqual(matchMeta('Plain', 'WIF', ['WIF']), ['WIF']);
+  assert.deepEqual(matchMeta('Plain', 'PLN', ['cat']), []);
+});
+
 // --- scoring ----------------------------------------------------------------
 
 test('better distribution scores higher, all else equal', () => {
@@ -398,6 +486,31 @@ test('a vertical 1h candle is penalised as a late entry', () => {
   const parabolic = enriched({ candidate: candidate({ priceChange: { m5: 1, h1: 900, h6: 140, h24: 200 } }) });
   assert.ok(scoreMomentum(parabolic).score < scoreMomentum(calm).score);
   assert.match(scoreMomentum(parabolic).reasons.join(' '), /late entry/);
+});
+
+test('the score weights sum to exactly 100', () => {
+  // Otherwise a "score out of 100" is a lie in one direction or the other.
+  assert.equal(Object.values(WEIGHTS).reduce((a, b) => a + b, 0), 100);
+});
+
+test('a paid, socialled token outscores an identical bare one', () => {
+  const rich = scoreMomentum(enriched()).score;
+  const bare = scoreMomentum(
+    enriched({
+      candidate: candidate({
+        presence: presence({ hasProfile: false, socials: [], websites: 0, paidOrders: [], paidAt: null }),
+      }),
+    }),
+  ).score;
+  assert.ok(rich > bare, `expected ${rich} > ${bare}`);
+});
+
+test('a token off its high scores below one making highs', () => {
+  const atHigh = scoreMomentum(enriched()).score;
+  const offHigh = scoreMomentum(
+    enriched({ candidate: candidate({ priceChange: { m5: -1, h1: -25, h6: 20, h24: 60 } }) }),
+  ).score;
+  assert.ok(atHigh > offHigh, `expected ${atHigh} > ${offHigh}`);
 });
 
 test('score stays within 0..100 for degenerate inputs', () => {

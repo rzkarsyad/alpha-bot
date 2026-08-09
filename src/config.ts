@@ -10,6 +10,22 @@ export type Thresholds = {
   minLiquidityUsd: number;
   /** Above this the "early" thesis is already priced in. */
   maxFdvUsd: number;
+  /** Market cap floor. Below this there is nothing to sell into. */
+  minMarketCapUsd: number;
+  /** Market cap ceiling — the number most people actually judge "early" by. */
+  maxMarketCapUsd: number;
+  /** Reject tokens with no profile, no socials, no boosts and nothing paid. */
+  requirePresence: boolean;
+  /** Reject unless someone paid DexScreener for placement. Strict; off by default. */
+  requireDexPaid: boolean;
+  /** Minimum linked social accounts. */
+  minSocials: number;
+  /** Reject once the price has fallen this far from its recent peak. */
+  maxDrawdownFromPeak: number;
+  /** Case-insensitive terms matched against name, symbol and DEX. Empty = no filter. */
+  metaTerms: string[];
+  /** Reject anything that does not match a meta term, rather than just ranking it lower. */
+  metaOnly: boolean;
   /** Minimum 1h volume — below this nobody is trading and you are the exit liquidity. */
   minVolumeH1Usd: number;
   /** Minimum 1h transaction count. Filters out volume faked by a handful of huge wash trades. */
@@ -51,6 +67,14 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   maxAgeHours: 72,
   minLiquidityUsd: 25_000,
   maxFdvUsd: 5_000_000,
+  minMarketCapUsd: 50_000,
+  maxMarketCapUsd: 5_000_000,
+  requirePresence: true,
+  requireDexPaid: false,
+  minSocials: 1,
+  maxDrawdownFromPeak: 0.5,
+  metaTerms: [],
+  metaOnly: false,
   minVolumeH1Usd: 20_000,
   minTxnsH1: 100,
   maxTop10Share: 0.25,
