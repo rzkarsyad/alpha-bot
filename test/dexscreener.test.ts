@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isBetterPair } from '../src/dexscreener.ts';
+import { isBetterPair, mergeAcrossPairs } from '../src/dexscreener.ts';
 import type { Candidate } from '../src/types.ts';
 
 function pair(overrides: Partial<Candidate>): Candidate {
@@ -17,6 +17,7 @@ function pair(overrides: Partial<Candidate>): Candidate {
       paidOrders: [], paidAt: null, ordersChecked: false,
     },
     liquidityUsd: null, fdv: null, marketCap: null, priceUsd: null, ageMinutes: 60,
+    tokenAgeMinutes: 60, priorMoveH6: null, priorMoveH24: null,
     volume: { m5: 0, h1: 0, h6: 0, h24: 0 },
     priceChange: { m5: 0, h1: 0, h6: 0, h24: 0 },
     txns: {
@@ -64,4 +65,30 @@ test('equal pairs do not displace the incumbent', () => {
   const a = pair({ liquidityUsd: 50_000 });
   const b = pair({ liquidityUsd: 50_000 });
   assert.equal(isBetterPair(a, b), false);
+});
+
+test('merging carries the token history across from pairs it has left behind', () => {
+  // The live pool is 12 minutes old and shows +4.5%; the retired bonding curve
+  // is 80 minutes old and still shows the +727% that already happened.
+  const graduated = pair({
+    dexId: 'pumpswap', liquidityUsd: 11_851, ageMinutes: 12,
+    priceChange: { m5: 1, h1: 4.5, h6: 4.5, h24: 4.5 },
+  });
+  const retired = pair({
+    dexId: 'pumpfun', liquidityUsd: null, ageMinutes: 80,
+    priceChange: { m5: 0, h1: 128, h6: 727, h24: 727 },
+  });
+
+  const merged = mergeAcrossPairs([graduated, retired]);
+  assert.equal(merged.dexId, 'pumpswap', 'judged on the routable pair');
+  assert.equal(merged.ageMinutes, 12, 'the chosen pair keeps its own age');
+  assert.equal(merged.tokenAgeMinutes, 80, 'but the token is as old as its oldest pair');
+  assert.equal(merged.priorMoveH6, 727, 'and the move it already made stays visible');
+});
+
+test('a single-pair token merges to itself', () => {
+  const only = pair({ liquidityUsd: 40_000, ageMinutes: 90, priceChange: { m5: 0, h1: 5, h6: 9, h24: 12 } });
+  const merged = mergeAcrossPairs([only]);
+  assert.equal(merged.tokenAgeMinutes, 90);
+  assert.equal(merged.priorMoveH6, 9);
 });

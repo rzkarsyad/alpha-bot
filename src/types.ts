@@ -78,7 +78,25 @@ export type Candidate = {
   fdv: number | null;
   marketCap: number | null;
   priceUsd: number | null;
+  /** Age of the pair being judged. */
   ageMinutes: number | null;
+  /**
+   * Age of the token's *oldest* pair.
+   *
+   * A graduated token gets a brand-new pool whose price history starts at zero,
+   * so the pair can be twelve minutes old while the token has been trading for
+   * hours. Judging "is this early" on pair age alone reads a graduation as a
+   * fresh launch.
+   */
+  tokenAgeMinutes: number | null;
+  /**
+   * Largest gain recorded on *any* of the token's pairs, over 6h and 24h.
+   *
+   * This is how a move that happened before graduation stays visible: the new
+   * pool shows +4%, the retired bonding curve still shows +727%.
+   */
+  priorMoveH6: number | null;
+  priorMoveH24: number | null;
   volume: PairStats;
   priceChange: PairStats;
   txns: TxnStats;

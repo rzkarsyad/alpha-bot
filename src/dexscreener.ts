@@ -78,6 +78,10 @@ function toCandidate(pair: RawPair, now: number): Candidate | null {
     marketCap: typeof pair.marketCap === 'number' ? pair.marketCap : null,
     priceUsd: pair.priceUsd ? Number(pair.priceUsd) : null,
     ageMinutes: pair.pairCreatedAt ? (now - pair.pairCreatedAt) / 60_000 : null,
+    // Filled in by fetchPairs once every pair for the mint has been seen.
+    tokenAgeMinutes: pair.pairCreatedAt ? (now - pair.pairCreatedAt) / 60_000 : null,
+    priorMoveH6: pair.priceChange?.h6 ?? null,
+    priorMoveH24: pair.priceChange?.h24 ?? null,
     volume: stats(pair.volume),
     priceChange: stats(pair.priceChange),
     txns: txnStats(pair.txns),
@@ -117,18 +121,47 @@ export async function fetchPairs(mints: string[]): Promise<Candidate[]> {
     batches.map((batch) => getJson<{ pairs?: RawPair[] }>(`/latest/dex/tokens/${batch.join(',')}`)),
   );
 
-  const best = new Map<string, Candidate>();
+  const byMint = new Map<string, Candidate[]>();
   for (const result of settled) {
     if (result.status !== 'fulfilled') continue;
     for (const pair of result.value.pairs ?? []) {
       if (pair.chainId !== 'solana') continue;
       const candidate = toCandidate(pair, now);
       if (!candidate) continue;
-      const incumbent = best.get(candidate.mint);
-      if (!incumbent || isBetterPair(candidate, incumbent)) best.set(candidate.mint, candidate);
+      const group = byMint.get(candidate.mint);
+      if (group) group.push(candidate);
+      else byMint.set(candidate.mint, [candidate]);
     }
   }
-  return [...best.values()];
+
+  return [...byMint.values()].map((pairs) => mergeAcrossPairs(pairs));
+}
+
+/**
+ * Judge a token on its most routable pair, but carry the token's real history
+ * across from the others.
+ *
+ * A graduation creates a fresh pool: twelve minutes of history on a token that
+ * has been trading for over an hour, showing +4% where the retired bonding
+ * curve still shows +727%. Reading only the chosen pair turns a token that
+ * already ran into a brand-new flat one — which is precisely the mistake
+ * pre-pump mode exists to avoid.
+ */
+export function mergeAcrossPairs(pairs: Candidate[]): Candidate {
+  const chosen = pairs.reduce((best, p) => (isBetterPair(p, best) ? p : best));
+
+  const ages = pairs.map((p) => p.ageMinutes).filter((a): a is number => a !== null);
+  const maxOf = (pick: (p: Candidate) => number | null): number | null => {
+    const values = pairs.map(pick).filter((v): v is number => v !== null);
+    return values.length > 0 ? Math.max(...values) : null;
+  };
+
+  return {
+    ...chosen,
+    tokenAgeMinutes: ages.length > 0 ? Math.max(...ages) : null,
+    priorMoveH6: maxOf((p) => p.priceChange.h6),
+    priorMoveH24: maxOf((p) => p.priceChange.h24),
+  };
 }
 
 /**

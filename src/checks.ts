@@ -169,13 +169,16 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
   }
 
   // --- Stage 4: tradeability ------------------------------------------------
-  if (c.ageMinutes === null) {
+  // Pair age is not token age: a graduated pool is minutes old on a token that
+  // has traded for hours. Judge the token.
+  const ageMinutes = c.tokenAgeMinutes ?? c.ageMinutes;
+  if (ageMinutes === null) {
     warnings.push('pair creation time unknown');
-  } else if (c.ageMinutes < t.minAgeMinutes) {
+  } else if (ageMinutes < t.minAgeMinutes) {
     // Floor, not round: at 29.6 minutes, "only 30m old (minimum 30m)" reads as a bug.
-    fail('age-young', `only ${Math.floor(c.ageMinutes)}m old (minimum ${t.minAgeMinutes}m)`);
-  } else if (c.ageMinutes > t.maxAgeHours * 60) {
-    fail('age-old', `${(c.ageMinutes / 60).toFixed(0)}h old — outside the early window`);
+    fail('age-young', `only ${Math.floor(ageMinutes)}m old (minimum ${t.minAgeMinutes}m)`);
+  } else if (ageMinutes > t.maxAgeHours * 60) {
+    fail('age-old', `${(ageMinutes / 60).toFixed(0)}h old — outside the early window`);
   }
 
   if (c.liquidityUsd === null) {
@@ -241,6 +244,13 @@ export function evaluate(enriched: Enriched, t: Thresholds): Verdict {
     }
     if (c.priceChange.h6 > t.maxPriceChangeH6) {
       fail('already-moved', `already +${c.priceChange.h6.toFixed(0)}% over 6h — not pre-pump any more`);
+    }
+    // The move may have happened on a pair this token has since left behind.
+    const prior = Math.max(c.priorMoveH6 ?? 0, c.priorMoveH24 ?? 0);
+    if (prior > t.maxPriceChangeH6 && prior > c.priceChange.h6) {
+      fail('already-moved',
+        `already +${prior.toFixed(0)}% on an earlier pair — this pool is new, the token is not`,
+      );
     }
     // "Pre-pump" means the move has not happened — not that it happened and
     // reversed. Without this, a token that ran and dumped sails through: its

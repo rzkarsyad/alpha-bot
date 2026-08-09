@@ -41,6 +41,9 @@ function candidate(overrides: Partial<Candidate> = {}): Candidate {
     marketCap: 900_000,
     priceUsd: 0.0009,
     ageMinutes: 300,
+    tokenAgeMinutes: 300,
+    priorMoveH6: 80,
+    priorMoveH24: 120,
     volume: { m5: 5_000, h1: 60_000, h6: 300_000, h24: 640_000 },
     priceChange: { m5: 2, h1: 20, h6: 80, h24: 120 },
     txns: {
@@ -374,13 +377,13 @@ test('unknown liquidity fails by default and passes when explicitly allowed', ()
   assert.match(permissive.warnings.join(' '), /liquidity unknown/);
 });
 
-test('a pair younger than the minimum age is a hard fail', () => {
-  const e = enriched({ candidate: candidate({ ageMinutes: 4 }) });
+test('a token younger than the minimum age is a hard fail', () => {
+  const e = enriched({ candidate: candidate({ ageMinutes: 4, tokenAgeMinutes: 4 }) });
   assert.match(failText(e), /only 4m old/);
 });
 
-test('a pair past the early window is a hard fail', () => {
-  const e = enriched({ candidate: candidate({ ageMinutes: 60 * 24 * 10 }) });
+test('a token past the early window is a hard fail', () => {
+  const e = enriched({ candidate: candidate({ ageMinutes: 60 * 24 * 10, tokenAgeMinutes: 60 * 24 * 10 }) });
   assert.match(failText(e), /outside the early window/);
 });
 
@@ -528,6 +531,39 @@ test('early mode rejects a token where nothing is picking up', () => {
     volume: { m5: 200, h1: 3_600, h6: 20_000, h24: 60_000 },
   });
   assert.match(evaluate(enriched({ candidate: flat }), EARLY).fails.join(' | '), /nothing is picking up/);
+});
+
+test('early mode sees a move that happened on a pair the token has left behind', () => {
+  // A graduation resets the pool's history: the new pair reads +4% while the
+  // retired bonding curve still shows +727%. Judging the chosen pair alone
+  // turns a token that already ran into a fresh flat one — caught live.
+  const graduated = candidate({
+    marketCap: 32_200, fdv: 32_200, liquidityUsd: 11_800,
+    ageMinutes: 12,
+    tokenAgeMinutes: 80,
+    priceChange: { m5: 1, h1: 4.5, h6: 4.5, h24: 4.5 },
+    priorMoveH6: 727,
+    priorMoveH24: 727,
+    volume: { m5: 1_600, h1: 19_300, h6: 19_300, h24: 19_300 },
+    txns: {
+      m5: { buys: 40, sells: 20 }, h1: { buys: 303, sells: 221 },
+      h6: { buys: 303, sells: 221 }, h24: { buys: 303, sells: 221 },
+    },
+  });
+  const text = evaluate(enriched({ candidate: graduated }), EARLY).fails.join(' | ');
+  assert.match(text, /on an earlier pair — this pool is new, the token is not/);
+});
+
+test('age gates read the token, not the pair it currently trades on', () => {
+  // Same trap: a 12-minute-old pool on a token that has traded for 10 hours.
+  // 12-minute-old pool, but the token has traded for ten days.
+  const graduated = candidate({ ageMinutes: 12, tokenAgeMinutes: 60 * 24 * 10 });
+  assert.match(failText(enriched({ candidate: graduated })), /outside the early window/);
+});
+
+test('a token with no prior pair is judged on the only one it has', () => {
+  const only = candidate({ ageMinutes: 45, tokenAgeMinutes: 45, priorMoveH6: null, priorMoveH24: null });
+  assert.deepEqual(evaluate(enriched({ candidate: only }), T).fails, []);
 });
 
 // --- scoring ----------------------------------------------------------------
